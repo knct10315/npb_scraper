@@ -1,7 +1,17 @@
+from fastapi import FastAPI
 from playwright.sync_api import sync_playwright, TimeoutError
 from datetime import datetime, timedelta
 import re
+import os
+import json
 import gspread
+from google.oauth2.service_account import Credentials
+
+# =====================
+# FastAPI
+# =====================
+
+app = FastAPI()
 
 # =====================
 # 設定
@@ -16,7 +26,6 @@ WORKSHEET_GID = 1879745082
 BETEXPLORER_TO_JST_HOURS = 7
 
 HEADLESS = True
-
 TARGET_HOURS = 48
 
 HANDICAP_LINES = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
@@ -25,6 +34,25 @@ CLEAR_RANGES = [
     "A10:E70",
     "J10:AA70",
 ]
+
+
+# =====================
+# FastAPI endpoints
+# =====================
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+
+@app.get("/run")
+def run_scraping():
+    results = run_job()
+
+    return {
+        "status": "completed",
+        "match_count": len(results)
+    }
 
 
 # =====================
@@ -56,6 +84,7 @@ def parse_betexplorer_datetime(date_label, time_text):
 def is_within_target_hours(dt):
     now = datetime.now()
     limit = now + timedelta(hours=TARGET_HOURS)
+
     return now <= dt <= limit
 
 
@@ -73,7 +102,7 @@ def safe_goto(page, url):
 
 
 # =====================
-# fixtures取得
+# Fixtures取得
 # =====================
 
 def get_fixture_rows(page):
@@ -113,6 +142,7 @@ def get_fixture_rows(page):
         home, away = [x.strip() for x in match_name.split(" - ", 1)]
 
         decimal_numbers = re.findall(r"\d+\.\d+", text)
+
         if len(decimal_numbers) < 2:
             continue
 
@@ -199,6 +229,7 @@ def extract_ah_odds(page, fixture):
         result[f"home_ah_{line:+.1f}"] = ""
         result[f"away_ah_{line:+.1f}"] = ""
 
+    # ML補完
     result["home_ah_-0.5"] = fixture["home_ml"]
     result["home_ah_+0.5"] = fixture["home_ml"]
     result["away_ah_-0.5"] = fixture["away_ml"]
@@ -226,6 +257,27 @@ def extract_ah_odds(page, fixture):
 # Google Sheets
 # =====================
 
+def get_gspread_client():
+    credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
+
+    if credentials_json:
+        credentials_info = json.loads(credentials_json)
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+
+        creds = Credentials.from_service_account_info(
+            credentials_info,
+            scopes=scopes
+        )
+
+        return gspread.authorize(creds)
+
+    return gspread.service_account(filename="credentials.json")
+
+
 def get_worksheet_by_gid(spreadsheet, gid):
     for ws in spreadsheet.worksheets():
         if ws.id == gid:
@@ -235,7 +287,7 @@ def get_worksheet_by_gid(spreadsheet, gid):
 
 
 def write_to_sheet(data):
-    gc = gspread.service_account(filename="credentials.json")
+    gc = get_gspread_client()
     sh = gc.open_by_url(SPREADSHEET_URL)
     ws = get_worksheet_by_gid(sh, WORKSHEET_GID)
 
@@ -247,34 +299,34 @@ def write_to_sheet(data):
 
     for r in data:
         left_values.append([
-            r["league"],
-            r["start_time_jst"],
-            r["home"],
-            r["away"],
-            "",
+            r["league"],              # A
+            r["start_time_jst"],      # B
+            r["home"],                # C
+            r["away"],                # D
+            "",                       # E
         ])
 
         right_values.append([
-            r["match_url"],
-            r["ah_url"],
+            r["match_url"],           # J
+            r["ah_url"],              # K
 
-            r["home_ah_-3.5"],
-            r["home_ah_-2.5"],
-            r["home_ah_-1.5"],
-            r["home_ah_-0.5"],
-            r["home_ah_+0.5"],
-            r["home_ah_+1.5"],
-            r["home_ah_+2.5"],
-            r["home_ah_+3.5"],
+            r["home_ah_-3.5"],        # L
+            r["home_ah_-2.5"],        # M
+            r["home_ah_-1.5"],        # N
+            r["home_ah_-0.5"],        # O
+            r["home_ah_+0.5"],        # P
+            r["home_ah_+1.5"],        # Q
+            r["home_ah_+2.5"],        # R
+            r["home_ah_+3.5"],        # S
 
-            r["away_ah_+3.5"],
-            r["away_ah_+2.5"],
-            r["away_ah_+1.5"],
-            r["away_ah_+0.5"],
-            r["away_ah_-0.5"],
-            r["away_ah_-1.5"],
-            r["away_ah_-2.5"],
-            r["away_ah_-3.5"],
+            r["away_ah_+3.5"],        # T
+            r["away_ah_+2.5"],        # U
+            r["away_ah_+1.5"],        # V
+            r["away_ah_+0.5"],        # W
+            r["away_ah_-0.5"],        # X
+            r["away_ah_-1.5"],        # Y
+            r["away_ah_-2.5"],        # Z
+            r["away_ah_-3.5"],        # AA
         ])
 
     if left_values:
@@ -285,21 +337,10 @@ def write_to_sheet(data):
 
 
 # =====================
-# main
+# 実行本体
 # =====================
 
-from fastapi import FastAPI
-
-app = FastAPI()
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-
-@app.get("/run")
-def run_scraping():
+def run_job():
     results = []
 
     with sync_playwright() as p:
@@ -314,7 +355,6 @@ def run_scraping():
             try:
                 ah = extract_ah_odds(page, f)
                 results.append({**f, **ah})
-
             except Exception as e:
                 print(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
 
@@ -322,7 +362,4 @@ def run_scraping():
 
     write_to_sheet(results)
 
-    return {
-        "status": "completed",
-        "match_count": len(results)
-    }
+    return results
