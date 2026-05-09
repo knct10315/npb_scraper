@@ -93,7 +93,7 @@ def is_within_target_hours(dt):
 # =====================
 
 def safe_goto(page, url):
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
     try:
         page.wait_for_selector("table", timeout=15000)
