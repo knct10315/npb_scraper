@@ -35,6 +35,8 @@ CLEAR_RANGES = [
     "J10:AA70",
 ]
 
+BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
+
 
 # =====================
 # FastAPI endpoints
@@ -84,8 +86,46 @@ def parse_betexplorer_datetime(date_label, time_text):
 def is_within_target_hours(dt):
     now = datetime.now()
     limit = now + timedelta(hours=TARGET_HOURS)
-
     return now <= dt <= limit
+
+
+# =====================
+# Playwright軽量化
+# =====================
+
+def launch_browser(playwright):
+    return playwright.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--mute-audio",
+            "--no-first-run",
+            "--disable-default-apps",
+        ]
+    )
+
+
+def new_light_page(browser):
+    page = browser.new_page()
+
+    def block_heavy_resources(route):
+        if route.request.resource_type in BLOCK_RESOURCE_TYPES:
+            route.abort()
+        else:
+            route.continue_()
+
+    page.route("**/*", block_heavy_resources)
+
+    return page
 
 
 # =====================
@@ -96,7 +136,7 @@ def safe_goto(page, url):
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
     try:
-        page.wait_for_selector("table", timeout=15000)
+        page.wait_for_selector("table", timeout=20000)
     except TimeoutError:
         raise Exception(f"tableが見つかりません: {url}")
 
@@ -191,11 +231,14 @@ def extract_ah_odds(page, fixture):
         numbers = re.findall(r"[-+]?\d+\.\d+", text)
 
         found_lines = []
+
         for n in numbers:
             try:
                 v = float(n)
+
                 if v in HANDICAP_LINES:
                     found_lines.append(v)
+
             except ValueError:
                 pass
 
@@ -203,11 +246,14 @@ def extract_ah_odds(page, fixture):
             continue
 
         odds = []
+
         for n in numbers:
             try:
                 v = float(n)
+
                 if 1.01 <= v <= 20:
                     odds.append(v)
+
             except ValueError:
                 pass
 
@@ -249,6 +295,21 @@ def extract_ah_odds(page, fixture):
 
         result[f"home_ah_{line:+.1f}"] = selected["home"]
         result[f"away_ah_{-line:+.1f}"] = selected["away"]
+
+    return result
+
+
+def empty_ah_result(fixture):
+    result = {}
+
+    for line in HANDICAP_LINES:
+        result[f"home_ah_{line:+.1f}"] = ""
+        result[f"away_ah_{line:+.1f}"] = ""
+
+    result["home_ah_-0.5"] = fixture["home_ml"]
+    result["home_ah_+0.5"] = fixture["home_ml"]
+    result["away_ah_-0.5"] = fixture["away_ml"]
+    result["away_ah_+0.5"] = fixture["away_ml"]
 
     return result
 
@@ -344,21 +405,27 @@ def run_job():
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        page = browser.new_page()
+        browser = launch_browser(p)
+        page = new_light_page(browser)
 
-        fixtures = get_fixture_rows(page)
+        try:
+            fixtures = get_fixture_rows(page)
 
-        for f in fixtures:
-            print(f"{f['start_time_jst']} {f['home']} vs {f['away']}")
+            for f in fixtures:
+                print(f"{f['start_time_jst']} {f['home']} vs {f['away']}")
 
-            try:
-                ah = extract_ah_odds(page, f)
-                results.append({**f, **ah})
-            except Exception as e:
-                print(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
+                try:
+                    ah = extract_ah_odds(page, f)
+                    results.append({**f, **ah})
+                except Exception as e:
+                    print(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
 
-        browser.close()
+                    # AH取得に失敗しても試合自体は残す
+                    ah = empty_ah_result(f)
+                    results.append({**f, **ah})
+
+        finally:
+            browser.close()
 
     write_to_sheet(results)
 
