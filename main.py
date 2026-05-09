@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI
 from playwright.sync_api import sync_playwright, TimeoutError
 from datetime import datetime, timedelta
 import re
@@ -37,16 +37,6 @@ CLEAR_RANGES = [
 
 BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 
-# 二重実行防止用
-IS_RUNNING = False
-LAST_STATUS = {
-    "status": "idle",
-    "message": "",
-    "match_count": 0,
-    "started_at": "",
-    "finished_at": "",
-}
-
 
 # =====================
 # FastAPI endpoints
@@ -57,64 +47,15 @@ def root():
     return {"status": "ok"}
 
 
-@app.get("/status")
-def status():
-    return LAST_STATUS
-
-
 @app.get("/run")
-def run_scraping(background_tasks: BackgroundTasks):
-    global IS_RUNNING, LAST_STATUS
-
-    if IS_RUNNING:
-        return {
-            "status": "already_running",
-            "message": "処理中です。しばらく待ってから/statusを確認してください。"
-        }
-
-    IS_RUNNING = True
-    LAST_STATUS = {
-        "status": "running",
-        "message": "処理を開始しました。",
-        "match_count": 0,
-        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "finished_at": "",
-    }
-
-    background_tasks.add_task(run_job_background)
+def run_scraping():
+    results = run_job()
 
     return {
-        "status": "started",
-        "message": "処理を開始しました。完了確認は /status を見てください。"
+        "status": "completed",
+        "match_count": len(results),
+        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
-
-
-def run_job_background():
-    global IS_RUNNING, LAST_STATUS
-
-    try:
-        results = run_job()
-
-        LAST_STATUS = {
-            "status": "completed",
-            "message": "シート更新完了",
-            "match_count": len(results),
-            "started_at": LAST_STATUS.get("started_at", ""),
-            "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-    except Exception as e:
-        LAST_STATUS = {
-            "status": "error",
-            "message": str(e),
-            "match_count": 0,
-            "started_at": LAST_STATUS.get("started_at", ""),
-            "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        print(f"全体エラー: {e}")
-
-    finally:
-        IS_RUNNING = False
 
 
 # =====================
@@ -366,6 +307,7 @@ def empty_ah_result(fixture):
         result[f"home_ah_{line:+.1f}"] = ""
         result[f"away_ah_{line:+.1f}"] = ""
 
+    # ML補完
     result["home_ah_-0.5"] = fixture["home_ml"]
     result["home_ah_+0.5"] = fixture["home_ml"]
     result["away_ah_-0.5"] = fixture["away_ml"]
