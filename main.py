@@ -1,4 +1,3 @@
-from fastapi import FastAPI
 from playwright.sync_api import sync_playwright, TimeoutError
 from datetime import datetime, timedelta
 import re
@@ -6,8 +5,6 @@ import os
 import json
 import gspread
 from google.oauth2.service_account import Credentials
-
-app = FastAPI()
 
 # =====================
 # 設定
@@ -20,7 +17,6 @@ SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1vjgGVoDYwmdEOjz8qcMFG
 WORKSHEET_GID = 1879745082
 
 BETEXPLORER_TO_JST_HOURS = 7
-
 HEADLESS = True
 TARGET_HOURS = 48
 
@@ -33,24 +29,6 @@ CLEAR_RANGES = [
 
 BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 
-# =====================
-# FastAPI
-# =====================
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-
-@app.get("/run")
-def run_scraping():
-    results = run_job()
-
-    return {
-        "status": "completed",
-        "match_count": len(results),
-        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
 
 # =====================
 # Utility
@@ -67,8 +45,9 @@ def is_bet_in_asia(text):
 def parse_float(value):
     try:
         return float(value)
-    except:
+    except Exception:
         return None
+
 
 # =====================
 # 日時
@@ -79,10 +58,8 @@ def parse_betexplorer_datetime(date_label, time_text):
 
     if date_label == "Today":
         base_date = now.date()
-
     elif date_label == "Tomorrow":
         base_date = (now + timedelta(days=1)).date()
-
     else:
         m = re.match(r"(\d{1,2})\.(\d{1,2})\.", date_label)
 
@@ -91,7 +68,6 @@ def parse_betexplorer_datetime(date_label, time_text):
 
         day = int(m.group(1))
         month = int(m.group(2))
-
         base_date = datetime(now.year, month, day).date()
 
     hour, minute = map(int, time_text.split(":"))
@@ -110,8 +86,8 @@ def parse_betexplorer_datetime(date_label, time_text):
 def is_within_target_hours(dt):
     now = datetime.now()
     limit = now + timedelta(hours=TARGET_HOURS)
-
     return now <= dt <= limit
+
 
 # =====================
 # Playwright
@@ -151,6 +127,7 @@ def new_light_page(browser):
 
     return page
 
+
 # =====================
 # Navigation
 # =====================
@@ -166,9 +143,9 @@ def safe_goto(page, url):
 
     try:
         page.wait_for_selector("table", timeout=30000)
-
     except TimeoutError:
         raise Exception(f"table not found: {url}")
+
 
 # =====================
 # Fixtures
@@ -180,7 +157,6 @@ def get_fixture_rows(page):
     rows = page.locator("table tr").all()
 
     fixtures = []
-
     last_date_label = None
     last_time_text = None
 
@@ -243,6 +219,7 @@ def get_fixture_rows(page):
 
     return fixtures
 
+
 # =====================
 # ML取得
 # =====================
@@ -302,6 +279,7 @@ def extract_moneyline_odds(page, fixture):
         "away_ml": selected["away_ml"]
     }
 
+
 # =====================
 # AH tab click
 # =====================
@@ -311,8 +289,8 @@ def ensure_ah_tab(page):
 
     rows = page.locator("table tr").all()
 
-    # 既にAHが見えてるか確認
-    for row in rows[:20]:
+    # 既にAHが見えているか確認
+    for row in rows[:30]:
         text = row.inner_text()
 
         if (
@@ -320,10 +298,12 @@ def ensure_ah_tab(page):
             or "+1.5" in text
             or "-2.5" in text
             or "+2.5" in text
+            or "-3.5" in text
+            or "+3.5" in text
         ):
             return
 
-    # タブクリック
+    # URLハッシュだけで切り替わらない場合、タブをクリック
     ah_selectors = [
         "text=Asian Handicap",
         "text=AH",
@@ -334,9 +314,9 @@ def ensure_ah_tab(page):
             page.locator(selector).first.click(timeout=3000)
             page.wait_for_timeout(3000)
             return
-
-        except:
+        except Exception:
             pass
+
 
 # =====================
 # AH取得
@@ -424,7 +404,6 @@ def extract_ah_odds(page, fixture):
         )
 
         result[f"home_ah_{line:+.1f}"] = selected["home"]
-
         result[f"away_ah_{-line:+.1f}"] = selected["away"]
 
     return result
@@ -444,6 +423,7 @@ def empty_ah_result(fixture):
     result["away_ah_+0.5"] = fixture["away_ml"]
 
     return result
+
 
 # =====================
 # Google Sheets
@@ -533,6 +513,7 @@ def write_to_sheet(data):
     if right_values:
         ws.update("J10", right_values)
 
+
 # =====================
 # Main
 # =====================
@@ -542,7 +523,6 @@ def run_job():
 
     with sync_playwright() as p:
         browser = launch_browser(p)
-
         page = new_light_page(browser)
 
         try:
@@ -604,4 +584,9 @@ def run_job():
 
     write_to_sheet(results)
 
+    print(f"完了: {len(results)} 件")
     return results
+
+
+if __name__ == "__main__":
+    run_job()
