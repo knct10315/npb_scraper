@@ -32,6 +32,10 @@ CLEAR_RANGES = [
 BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 
 
+# =====================
+# Utility
+# =====================
+
 def normalize_text(text):
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
@@ -47,20 +51,32 @@ def parse_float(value):
         return None
 
 
+def is_valid_decimal_odds(value):
+    return value is not None and 1.01 < value <= 20
+
+
+# =====================
+# 日時
+# =====================
+
 def parse_betexplorer_datetime(date_label, time_text):
     now = datetime.now()
 
     if date_label == "Today":
         base_date = now.date()
+
     elif date_label == "Tomorrow":
         base_date = (now + timedelta(days=1)).date()
+
     else:
         m = re.match(r"(\d{1,2})\.(\d{1,2})\.", date_label)
+
         if not m:
             return None
 
         day = int(m.group(1))
         month = int(m.group(2))
+
         base_date = datetime(now.year, month, day).date()
 
     hour, minute = map(int, time_text.split(":"))
@@ -79,8 +95,13 @@ def parse_betexplorer_datetime(date_label, time_text):
 def is_within_target_hours(dt):
     now = datetime.now()
     limit = now + timedelta(hours=TARGET_HOURS)
+
     return now <= dt <= limit
 
+
+# =====================
+# Playwright
+# =====================
 
 def launch_browser(playwright):
     return playwright.chromium.launch(
@@ -113,8 +134,13 @@ def new_light_page(browser):
             route.continue_()
 
     page.route("**/*", block_heavy_resources)
+
     return page
 
+
+# =====================
+# Navigation
+# =====================
 
 def safe_goto(page, url):
     page.goto(
@@ -127,9 +153,14 @@ def safe_goto(page, url):
 
     try:
         page.wait_for_selector("table", timeout=30000)
+
     except TimeoutError:
         raise Exception(f"table not found: {url}")
 
+
+# =====================
+# Fixtures
+# =====================
 
 def get_fixture_rows(page):
     safe_goto(page, FIXTURES_URL)
@@ -137,6 +168,7 @@ def get_fixture_rows(page):
     rows = page.locator("table tr").all()
 
     fixtures = []
+
     last_date_label = None
     last_time_text = None
 
@@ -156,6 +188,7 @@ def get_fixture_rows(page):
             continue
 
         link = row.locator("a").first
+
         match_name = link.inner_text().strip()
         href = link.get_attribute("href")
 
@@ -181,6 +214,7 @@ def get_fixture_rows(page):
         if not is_within_target_hours(start_time):
             continue
 
+        # オッズ未掲載試合除外
         decimal_numbers = re.findall(r"\d+\.\d+", text)
 
         if len(decimal_numbers) < 2:
@@ -198,8 +232,19 @@ def get_fixture_rows(page):
     return fixtures
 
 
-def extract_moneyline_odds(page, fixture):
-    safe_goto(page, fixture["match_url"])
+# =====================
+# ML取得
+# =====================
+
+def extract_moneyline_odds_from_current_page(page, fixture):
+    """
+    試合詳細ページの現在表示テーブルからMLを取得。
+    MLBでは ROW 0 の BOOKMAKERS 見出し行を除外する必要あり。
+    想定セル:
+      CELL 0: bookmaker
+      CELL 4: home ML
+      CELL 5: away ML
+    """
 
     rows = page.locator("table tr").all()
 
@@ -211,17 +256,27 @@ def extract_moneyline_odds(page, fixture):
         if len(cells) < 6:
             continue
 
-        texts = [c.inner_text().strip() for c in cells]
+        texts = [
+            c.inner_text().strip()
+            for c in cells
+        ]
 
         bookmaker = texts[0]
 
         if not bookmaker:
             continue
 
+        # 見出し行除外
+        if "bookmakers" in bookmaker.lower():
+            continue
+
         home_ml = parse_float(texts[4])
         away_ml = parse_float(texts[5])
 
-        if home_ml is None or away_ml is None:
+        if not is_valid_decimal_odds(home_ml):
+            continue
+
+        if not is_valid_decimal_odds(away_ml):
             continue
 
         candidates.append({
@@ -251,12 +306,14 @@ def extract_moneyline_odds(page, fixture):
     }
 
 
-def ensure_ah_tab(page):
-    page.wait_for_timeout(2000)
+# =====================
+# AHタブ切替
+# =====================
 
+def ah_lines_visible(page):
     rows = page.locator("table tr").all()
 
-    for row in rows[:30]:
+    for row in rows[:40]:
         text = row.inner_text()
 
         if (
@@ -267,7 +324,16 @@ def ensure_ah_tab(page):
             or "-3.5" in text
             or "+3.5" in text
         ):
-            return
+            return True
+
+    return False
+
+
+def ensure_ah_tab(page):
+    page.wait_for_timeout(1000)
+
+    if ah_lines_visible(page):
+        return
 
     ah_selectors = [
         "text=Asian Handicap",
@@ -276,21 +342,56 @@ def ensure_ah_tab(page):
 
     for selector in ah_selectors:
         try:
-            page.locator(selector).first.click(timeout=3000)
+            page.locator(selector).first.click(timeout=5000)
             page.wait_for_timeout(3000)
-            return
+
+            if ah_lines_visible(page):
+                return
+
         except Exception:
             pass
 
+    # URLハッシュを直接変えてみる
+    try:
+        current_url = page.url.split("#")[0]
+        page.goto(
+            current_url + "#ah",
+            wait_until="domcontentloaded",
+            timeout=60000
+        )
+        page.wait_for_timeout(3000)
 
-def extract_ah_odds(page, fixture):
-    safe_goto(page, fixture["ah_url"])
+        if ah_lines_visible(page):
+            return
+
+    except Exception:
+        pass
+
+    raise Exception("AH tab not visible")
+
+
+# =====================
+# AH取得
+# =====================
+
+def extract_ah_odds_from_current_page(page, fixture):
+    """
+    現在ページ上でAHタブを表示してからAH取得。
+    想定セル:
+      CELL 0: bookmaker
+      CELL 4: handicap line
+      CELL 5: home odds
+      CELL 6: away odds
+    """
 
     ensure_ah_tab(page)
 
     rows = page.locator("table tr").all()
 
-    candidates = {line: [] for line in HANDICAP_LINES}
+    candidates = {
+        line: []
+        for line in HANDICAP_LINES
+    }
 
     for row in rows:
         cells = row.locator("th, td").all()
@@ -298,11 +399,17 @@ def extract_ah_odds(page, fixture):
         if len(cells) < 7:
             continue
 
-        texts = [c.inner_text().strip() for c in cells]
+        texts = [
+            c.inner_text().strip()
+            for c in cells
+        ]
 
         bookmaker = texts[0]
 
         if not bookmaker:
+            continue
+
+        if "bookmakers" in bookmaker.lower():
             continue
 
         line = parse_float(texts[4])
@@ -316,7 +423,10 @@ def extract_ah_odds(page, fixture):
         home_odds = parse_float(texts[5])
         away_odds = parse_float(texts[6])
 
-        if home_odds is None or away_odds is None:
+        if not is_valid_decimal_odds(home_odds):
+            continue
+
+        if not is_valid_decimal_odds(away_odds):
             continue
 
         candidates[line].append({
@@ -332,6 +442,7 @@ def extract_ah_odds(page, fixture):
         result[f"home_ah_{line:+.1f}"] = ""
         result[f"away_ah_{line:+.1f}"] = ""
 
+    # ML補完
     result["home_ah_-0.5"] = fixture["home_ml"]
     result["home_ah_+0.5"] = fixture["home_ml"]
 
@@ -358,6 +469,8 @@ def extract_ah_odds(page, fixture):
         )
 
         result[f"home_ah_{line:+.1f}"] = selected["home"]
+
+        # awayは反対符号へ入れる
         result[f"away_ah_{-line:+.1f}"] = selected["away"]
 
     return result
@@ -379,6 +492,10 @@ def empty_ah_result(fixture):
     return result
 
 
+# =====================
+# Google Sheets
+# =====================
+
 def get_gspread_client():
     credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
 
@@ -397,7 +514,9 @@ def get_gspread_client():
 
         return gspread.authorize(creds)
 
-    return gspread.service_account(filename="credentials.json")
+    return gspread.service_account(
+        filename="credentials.json"
+    )
 
 
 def get_worksheet_by_gid(spreadsheet, gid):
@@ -410,8 +529,13 @@ def get_worksheet_by_gid(spreadsheet, gid):
 
 def write_to_sheet(data):
     gc = get_gspread_client()
+
     sh = gc.open_by_url(SPREADSHEET_URL)
-    ws = get_worksheet_by_gid(sh, WORKSHEET_GID)
+
+    ws = get_worksheet_by_gid(
+        sh,
+        WORKSHEET_GID
+    )
 
     ws.batch_clear(CLEAR_RANGES)
 
@@ -451,11 +575,15 @@ def write_to_sheet(data):
         ])
 
     if left_values:
-        ws.update("A10", left_values)
+        ws.update(range_name="A10", values=left_values)
 
     if right_values:
-        ws.update("J10", right_values)
+        ws.update(range_name="J10", values=right_values)
 
+
+# =====================
+# Main
+# =====================
 
 def run_job():
     results = []
@@ -474,28 +602,52 @@ def run_job():
                 )
 
                 try:
-                    ml = extract_moneyline_odds(page, f)
-                    f = {**f, **ml}
+                    # 試合ページは1回だけ開く
+                    safe_goto(page, f["match_url"])
+
+                    ml = extract_moneyline_odds_from_current_page(
+                        page,
+                        f
+                    )
+
+                    f = {
+                        **f,
+                        **ml
+                    }
 
                 except Exception as e:
                     print(
                         f"ML取得失敗: "
-                        f"{f['home']} vs {f['away']} / {e}"
+                        f"{f['home']} vs {f['away']} "
+                        f"/ {e}"
                     )
                     continue
 
                 try:
-                    ah = extract_ah_odds(page, f)
-                    results.append({**f, **ah})
+                    # 同じページ上でAHタブに切り替えて取得
+                    ah = extract_ah_odds_from_current_page(
+                        page,
+                        f
+                    )
+
+                    results.append({
+                        **f,
+                        **ah
+                    })
 
                 except Exception as e:
                     print(
                         f"AH取得失敗: "
-                        f"{f['home']} vs {f['away']} / {e}"
+                        f"{f['home']} vs {f['away']} "
+                        f"/ {e}"
                     )
 
                     ah = empty_ah_result(f)
-                    results.append({**f, **ah})
+
+                    results.append({
+                        **f,
+                        **ah
+                    })
 
         finally:
             browser.close()
