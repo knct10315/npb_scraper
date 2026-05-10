@@ -7,15 +7,7 @@ import json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# =====================
-# FastAPI
-# =====================
-
 app = FastAPI()
-
-# =====================
-# 設定
-# =====================
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -24,7 +16,6 @@ SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1vjgGVoDYwmdEOjz8qcMFG
 WORKSHEET_GID = 1879745082
 
 BETEXPLORER_TO_JST_HOURS = 7
-
 HEADLESS = True
 TARGET_HOURS = 48
 
@@ -38,10 +29,6 @@ CLEAR_RANGES = [
 BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 
 
-# =====================
-# FastAPI endpoints
-# =====================
-
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -50,7 +37,6 @@ def root():
 @app.get("/run")
 def run_scraping():
     results = run_job()
-
     return {
         "status": "completed",
         "match_count": len(results),
@@ -58,9 +44,14 @@ def run_scraping():
     }
 
 
-# =====================
-# 日時
-# =====================
+def normalize_text(text):
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def is_bet_in_asia(text):
+    normalized = normalize_text(text)
+    return "betinasia" in normalized
+
 
 def parse_betexplorer_datetime(date_label, time_text):
     now = datetime.now()
@@ -73,7 +64,6 @@ def parse_betexplorer_datetime(date_label, time_text):
         m = re.match(r"(\d{1,2})\.(\d{1,2})\.", date_label)
         if not m:
             return None
-
         day = int(m.group(1))
         month = int(m.group(2))
         base_date = datetime(now.year, month, day).date()
@@ -89,10 +79,6 @@ def is_within_target_hours(dt):
     limit = now + timedelta(hours=TARGET_HOURS)
     return now <= dt <= limit
 
-
-# =====================
-# Playwright軽量化
-# =====================
 
 def launch_browser(playwright):
     return playwright.chromium.launch(
@@ -125,13 +111,8 @@ def new_light_page(browser):
             route.continue_()
 
     page.route("**/*", block_heavy_resources)
-
     return page
 
-
-# =====================
-# 画面遷移
-# =====================
 
 def safe_goto(page, url):
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -141,10 +122,6 @@ def safe_goto(page, url):
     except TimeoutError:
         raise Exception(f"tableが見つかりません: {url}")
 
-
-# =====================
-# Fixtures取得
-# =====================
 
 def get_fixture_rows(page):
     safe_goto(page, FIXTURES_URL)
@@ -182,14 +159,6 @@ def get_fixture_rows(page):
 
         home, away = [x.strip() for x in match_name.split(" - ", 1)]
 
-        decimal_numbers = re.findall(r"\d+\.\d+", text)
-
-        if len(decimal_numbers) < 2:
-            continue
-
-        home_ml = decimal_numbers[-2]
-        away_ml = decimal_numbers[-1]
-
         start_time = parse_betexplorer_datetime(last_date_label, last_time_text)
 
         if start_time is None:
@@ -198,13 +167,16 @@ def get_fixture_rows(page):
         if not is_within_target_hours(start_time):
             continue
 
+        # fixtures上にMLらしき数字が無い試合は、まだオッズ無しとしてスキップ
+        decimal_numbers = re.findall(r"\d+\.\d+", text)
+        if len(decimal_numbers) < 2:
+            continue
+
         fixtures.append({
             "league": "NPB",
             "start_time_jst": start_time.strftime("%Y-%m-%d %H:%M"),
             "home": home,
             "away": away,
-            "home_ml": home_ml,
-            "away_ml": away_ml,
             "match_url": BASE_URL + href,
             "ah_url": BASE_URL + href + "#ah"
         })
@@ -212,11 +184,75 @@ def get_fixture_rows(page):
     return fixtures
 
 
-# =====================
-# AH取得
-# =====================
+def extract_odds_numbers(text):
+    values = []
+
+    for n in re.findall(r"[-+]?\d+\.\d+", text):
+        try:
+            v = float(n)
+        except ValueError:
+            continue
+
+        if 1.01 <= v <= 20:
+            values.append(v)
+
+    return values
+
+
+def extract_moneyline_odds(page, fixture):
+    """
+    試合詳細ページから業者別MLを取得。
+    BetInAsia優先、なければ一番上。
+    """
+    safe_goto(page, fixture["match_url"])
+
+    rows = page.locator("table tr").all()
+
+    candidates = []
+
+    for row in rows:
+        text = row.inner_text().strip()
+
+        if not text:
+            continue
+
+        # AH行などをなるべく除外
+        if any(token in text for token in ["+0.5", "-0.5", "+1.5", "-1.5", "+2.5", "-2.5", "+3.5", "-3.5"]):
+            continue
+
+        odds = extract_odds_numbers(text)
+
+        if len(odds) < 2:
+            continue
+
+        candidates.append({
+            "is_bia": is_bet_in_asia(text),
+            "home_ml": odds[-2],
+            "away_ml": odds[-1],
+            "raw_text": text
+        })
+
+    if not candidates:
+        raise Exception("ML候補が見つかりません")
+
+    selected = next(
+        (c for c in candidates if c["is_bia"]),
+        candidates[0]
+    )
+
+    print(f"ML選択: {fixture['home']} vs {fixture['away']} / BIA={selected['is_bia']} / {selected['home_ml']} - {selected['away_ml']}")
+
+    return {
+        "home_ml": selected["home_ml"],
+        "away_ml": selected["away_ml"]
+    }
+
 
 def extract_ah_odds(page, fixture):
+    """
+    AHページから業者別AHを取得。
+    各ラインごとにBetInAsia優先、なければ一番上。
+    """
     safe_goto(page, fixture["ah_url"])
 
     rows = page.locator("table tr").all()
@@ -236,38 +272,26 @@ def extract_ah_odds(page, fixture):
         for n in numbers:
             try:
                 v = float(n)
-
-                if v in HANDICAP_LINES:
-                    found_lines.append(v)
-
             except ValueError:
-                pass
+                continue
+
+            if v in HANDICAP_LINES:
+                found_lines.append(v)
 
         if not found_lines:
             continue
 
-        odds = []
-
-        for n in numbers:
-            try:
-                v = float(n)
-
-                if 1.01 <= v <= 20:
-                    odds.append(v)
-
-            except ValueError:
-                pass
+        odds = extract_odds_numbers(text)
 
         if len(odds) < 2:
             continue
 
-        is_bia = "bet in asia" in text.lower()
-
         for line in found_lines:
             candidates[line].append({
-                "is_bia": is_bia,
+                "is_bia": is_bet_in_asia(text),
                 "home": odds[-2],
-                "away": odds[-1]
+                "away": odds[-1],
+                "raw_text": text
             })
 
     result = {}
@@ -294,6 +318,12 @@ def extract_ah_odds(page, fixture):
             candidates[line][0]
         )
 
+        print(
+            f"AH選択: {fixture['home']} vs {fixture['away']} "
+            f"line={line:+.1f} / BIA={selected['is_bia']} "
+            f"/ {selected['home']} - {selected['away']}"
+        )
+
         result[f"home_ah_{line:+.1f}"] = selected["home"]
         result[f"away_ah_{-line:+.1f}"] = selected["away"]
 
@@ -307,7 +337,6 @@ def empty_ah_result(fixture):
         result[f"home_ah_{line:+.1f}"] = ""
         result[f"away_ah_{line:+.1f}"] = ""
 
-    # ML補完
     result["home_ah_-0.5"] = fixture["home_ml"]
     result["home_ah_+0.5"] = fixture["home_ml"]
     result["away_ah_-0.5"] = fixture["away_ml"]
@@ -315,10 +344,6 @@ def empty_ah_result(fixture):
 
     return result
 
-
-# =====================
-# Google Sheets
-# =====================
 
 def get_gspread_client():
     credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -354,7 +379,6 @@ def write_to_sheet(data):
     sh = gc.open_by_url(SPREADSHEET_URL)
     ws = get_worksheet_by_gid(sh, WORKSHEET_GID)
 
-    # F〜Iは触らず、A〜E・J〜AAだけクリア
     ws.batch_clear(CLEAR_RANGES)
 
     left_values = []
@@ -362,34 +386,34 @@ def write_to_sheet(data):
 
     for r in data:
         left_values.append([
-            r["league"],              # A
-            r["start_time_jst"],      # B
-            r["home"],                # C
-            r["away"],                # D
-            "",                       # E
+            r["league"],
+            r["start_time_jst"],
+            r["home"],
+            r["away"],
+            "",
         ])
 
         right_values.append([
-            r["match_url"],           # J
-            r["ah_url"],              # K
+            r["match_url"],
+            r["ah_url"],
 
-            r["home_ah_-3.5"],        # L
-            r["home_ah_-2.5"],        # M
-            r["home_ah_-1.5"],        # N
-            r["home_ah_-0.5"],        # O
-            r["home_ah_+0.5"],        # P
-            r["home_ah_+1.5"],        # Q
-            r["home_ah_+2.5"],        # R
-            r["home_ah_+3.5"],        # S
+            r["home_ah_-3.5"],
+            r["home_ah_-2.5"],
+            r["home_ah_-1.5"],
+            r["home_ah_-0.5"],
+            r["home_ah_+0.5"],
+            r["home_ah_+1.5"],
+            r["home_ah_+2.5"],
+            r["home_ah_+3.5"],
 
-            r["away_ah_+3.5"],        # T
-            r["away_ah_+2.5"],        # U
-            r["away_ah_+1.5"],        # V
-            r["away_ah_+0.5"],        # W
-            r["away_ah_-0.5"],        # X
-            r["away_ah_-1.5"],        # Y
-            r["away_ah_-2.5"],        # Z
-            r["away_ah_-3.5"],        # AA
+            r["away_ah_+3.5"],
+            r["away_ah_+2.5"],
+            r["away_ah_+1.5"],
+            r["away_ah_+0.5"],
+            r["away_ah_-0.5"],
+            r["away_ah_-1.5"],
+            r["away_ah_-2.5"],
+            r["away_ah_-3.5"],
         ])
 
     if left_values:
@@ -398,10 +422,6 @@ def write_to_sheet(data):
     if right_values:
         ws.update("J10", right_values)
 
-
-# =====================
-# 実行本体
-# =====================
 
 def run_job():
     results = []
@@ -417,13 +437,18 @@ def run_job():
                 print(f"{f['start_time_jst']} {f['home']} vs {f['away']}")
 
                 try:
+                    ml = extract_moneyline_odds(page, f)
+                    f = {**f, **ml}
+                except Exception as e:
+                    print(f"ML取得失敗: {f['home']} vs {f['away']} / {e}")
+                    continue
+
+                try:
                     ah = extract_ah_odds(page, f)
                     results.append({**f, **ah})
 
                 except Exception as e:
                     print(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
-
-                    # AH取得に失敗しても試合自体は残す
                     ah = empty_ah_result(f)
                     results.append({**f, **ah})
 
