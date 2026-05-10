@@ -9,6 +9,10 @@ from google.oauth2.service_account import Credentials
 
 app = FastAPI()
 
+# =====================
+# 設定
+# =====================
+
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
 
@@ -16,6 +20,7 @@ SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1vjgGVoDYwmdEOjz8qcMFG
 WORKSHEET_GID = 1879745082
 
 BETEXPLORER_TO_JST_HOURS = 7
+
 HEADLESS = True
 TARGET_HOURS = 48
 
@@ -28,6 +33,9 @@ CLEAR_RANGES = [
 
 BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 
+# =====================
+# FastAPI
+# =====================
 
 @app.get("/")
 def root():
@@ -37,39 +45,64 @@ def root():
 @app.get("/run")
 def run_scraping():
     results = run_job()
+
     return {
         "status": "completed",
         "match_count": len(results),
         "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+# =====================
+# Utility
+# =====================
 
 def normalize_text(text):
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
 def is_bet_in_asia(text):
-    normalized = normalize_text(text)
-    return "betinasia" in normalized
+    return "betinasia" in normalize_text(text)
 
+
+def parse_float(value):
+    try:
+        return float(value)
+    except:
+        return None
+
+# =====================
+# 日時
+# =====================
 
 def parse_betexplorer_datetime(date_label, time_text):
     now = datetime.now()
 
     if date_label == "Today":
         base_date = now.date()
+
     elif date_label == "Tomorrow":
         base_date = (now + timedelta(days=1)).date()
+
     else:
         m = re.match(r"(\d{1,2})\.(\d{1,2})\.", date_label)
+
         if not m:
             return None
+
         day = int(m.group(1))
         month = int(m.group(2))
+
         base_date = datetime(now.year, month, day).date()
 
     hour, minute = map(int, time_text.split(":"))
-    raw_dt = datetime(base_date.year, base_date.month, base_date.day, hour, minute)
+
+    raw_dt = datetime(
+        base_date.year,
+        base_date.month,
+        base_date.day,
+        hour,
+        minute
+    )
 
     return raw_dt + timedelta(hours=BETEXPLORER_TO_JST_HOURS)
 
@@ -77,8 +110,12 @@ def parse_betexplorer_datetime(date_label, time_text):
 def is_within_target_hours(dt):
     now = datetime.now()
     limit = now + timedelta(hours=TARGET_HOURS)
+
     return now <= dt <= limit
 
+# =====================
+# Playwright
+# =====================
 
 def launch_browser(playwright):
     return playwright.chromium.launch(
@@ -111,17 +148,31 @@ def new_light_page(browser):
             route.continue_()
 
     page.route("**/*", block_heavy_resources)
+
     return page
 
+# =====================
+# Navigation
+# =====================
 
 def safe_goto(page, url):
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=60000
+    )
+
+    page.wait_for_timeout(2000)
 
     try:
-        page.wait_for_selector("table", timeout=20000)
-    except TimeoutError:
-        raise Exception(f"tableが見つかりません: {url}")
+        page.wait_for_selector("table", timeout=30000)
 
+    except TimeoutError:
+        raise Exception(f"table not found: {url}")
+
+# =====================
+# Fixtures
+# =====================
 
 def get_fixture_rows(page):
     safe_goto(page, FIXTURES_URL)
@@ -129,6 +180,7 @@ def get_fixture_rows(page):
     rows = page.locator("table tr").all()
 
     fixtures = []
+
     last_date_label = None
     last_time_text = None
 
@@ -148,6 +200,7 @@ def get_fixture_rows(page):
             continue
 
         link = row.locator("a").first
+
         match_name = link.inner_text().strip()
         href = link.get_attribute("href")
 
@@ -157,9 +210,15 @@ def get_fixture_rows(page):
         if " - " not in match_name:
             continue
 
-        home, away = [x.strip() for x in match_name.split(" - ", 1)]
+        home, away = [
+            x.strip()
+            for x in match_name.split(" - ", 1)
+        ]
 
-        start_time = parse_betexplorer_datetime(last_date_label, last_time_text)
+        start_time = parse_betexplorer_datetime(
+            last_date_label,
+            last_time_text
+        )
 
         if start_time is None:
             continue
@@ -167,8 +226,9 @@ def get_fixture_rows(page):
         if not is_within_target_hours(start_time):
             continue
 
-        # fixtures上にMLらしき数字が無い試合は、まだオッズ無しとしてスキップ
+        # オッズ未掲載試合除外
         decimal_numbers = re.findall(r"\d+\.\d+", text)
+
         if len(decimal_numbers) < 2:
             continue
 
@@ -183,27 +243,11 @@ def get_fixture_rows(page):
 
     return fixtures
 
-
-def extract_odds_numbers(text):
-    values = []
-
-    for n in re.findall(r"[-+]?\d+\.\d+", text):
-        try:
-            v = float(n)
-        except ValueError:
-            continue
-
-        if 1.01 <= v <= 20:
-            values.append(v)
-
-    return values
-
+# =====================
+# ML取得
+# =====================
 
 def extract_moneyline_odds(page, fixture):
-    """
-    試合詳細ページから業者別MLを取得。
-    BetInAsia優先、なければ一番上。
-    """
     safe_goto(page, fixture["match_url"])
 
     rows = page.locator("table tr").all()
@@ -211,88 +255,141 @@ def extract_moneyline_odds(page, fixture):
     candidates = []
 
     for row in rows:
-        text = row.inner_text().strip()
+        cells = row.locator("th, td").all()
 
-        if not text:
+        if len(cells) < 6:
             continue
 
-        # AH行などをなるべく除外
-        if any(token in text for token in ["+0.5", "-0.5", "+1.5", "-1.5", "+2.5", "-2.5", "+3.5", "-3.5"]):
+        texts = [
+            c.inner_text().strip()
+            for c in cells
+        ]
+
+        bookmaker = texts[0]
+
+        if not bookmaker:
             continue
 
-        odds = extract_odds_numbers(text)
+        home_ml = parse_float(texts[4])
+        away_ml = parse_float(texts[5])
 
-        if len(odds) < 2:
+        if home_ml is None or away_ml is None:
             continue
 
         candidates.append({
-            "is_bia": is_bet_in_asia(text),
-            "home_ml": odds[-2],
-            "away_ml": odds[-1],
-            "raw_text": text
+            "bookmaker": bookmaker,
+            "is_bia": is_bet_in_asia(bookmaker),
+            "home_ml": home_ml,
+            "away_ml": away_ml
         })
 
     if not candidates:
-        raise Exception("ML候補が見つかりません")
+        raise Exception("ML candidate not found")
 
     selected = next(
         (c for c in candidates if c["is_bia"]),
         candidates[0]
     )
 
-    print(f"ML選択: {fixture['home']} vs {fixture['away']} / BIA={selected['is_bia']} / {selected['home_ml']} - {selected['away_ml']}")
+    print(
+        f"ML {fixture['home']} vs {fixture['away']} "
+        f"/ {selected['bookmaker']} "
+        f"/ {selected['home_ml']} - {selected['away_ml']}"
+    )
 
     return {
         "home_ml": selected["home_ml"],
         "away_ml": selected["away_ml"]
     }
 
+# =====================
+# AH tab click
+# =====================
 
-def extract_ah_odds(page, fixture):
-    """
-    AHページから業者別AHを取得。
-    各ラインごとにBetInAsia優先、なければ一番上。
-    """
-    safe_goto(page, fixture["ah_url"])
+def ensure_ah_tab(page):
+    page.wait_for_timeout(2000)
 
     rows = page.locator("table tr").all()
 
-    candidates = {line: [] for line in HANDICAP_LINES}
+    # 既にAHが見えてるか確認
+    for row in rows[:20]:
+        text = row.inner_text()
+
+        if (
+            "-1.5" in text
+            or "+1.5" in text
+            or "-2.5" in text
+            or "+2.5" in text
+        ):
+            return
+
+    # タブクリック
+    ah_selectors = [
+        "text=Asian Handicap",
+        "text=AH",
+    ]
+
+    for selector in ah_selectors:
+        try:
+            page.locator(selector).first.click(timeout=3000)
+            page.wait_for_timeout(3000)
+            return
+
+        except:
+            pass
+
+# =====================
+# AH取得
+# =====================
+
+def extract_ah_odds(page, fixture):
+    safe_goto(page, fixture["ah_url"])
+
+    ensure_ah_tab(page)
+
+    rows = page.locator("table tr").all()
+
+    candidates = {
+        line: []
+        for line in HANDICAP_LINES
+    }
 
     for row in rows:
-        text = row.inner_text().strip()
+        cells = row.locator("th, td").all()
 
-        if not text:
+        if len(cells) < 7:
             continue
 
-        numbers = re.findall(r"[-+]?\d+\.\d+", text)
+        texts = [
+            c.inner_text().strip()
+            for c in cells
+        ]
 
-        found_lines = []
+        bookmaker = texts[0]
 
-        for n in numbers:
-            try:
-                v = float(n)
-            except ValueError:
-                continue
-
-            if v in HANDICAP_LINES:
-                found_lines.append(v)
-
-        if not found_lines:
+        if not bookmaker:
             continue
 
-        odds = extract_odds_numbers(text)
+        line = parse_float(texts[4])
 
-        if len(odds) < 2:
+        if line is None:
             continue
 
-        for line in found_lines:
-            candidates[line].append({
-                "is_bia": is_bet_in_asia(text),
-                "home": odds[-2],
-                "away": odds[-1],
-                "raw_text": text
-            })
+        if line not in HANDICAP_LINES:
+            continue
+
+        home_odds = parse_float(texts[5])
+        away_odds = parse_float(texts[6])
+
+        if home_odds is None or away_odds is None:
+            continue
+
+        candidates[line].append({
+            "bookmaker": bookmaker,
+            "is_bia": is_bet_in_asia(bookmaker),
+            "home": home_odds,
+            "away": away_odds
+        })
 
     result = {}
 
@@ -303,6 +400,7 @@ def extract_ah_odds(page, fixture):
     # ML補完
     result["home_ah_-0.5"] = fixture["home_ml"]
     result["home_ah_+0.5"] = fixture["home_ml"]
+
     result["away_ah_-0.5"] = fixture["away_ml"]
     result["away_ah_+0.5"] = fixture["away_ml"]
 
@@ -319,12 +417,14 @@ def extract_ah_odds(page, fixture):
         )
 
         print(
-            f"AH選択: {fixture['home']} vs {fixture['away']} "
-            f"line={line:+.1f} / BIA={selected['is_bia']} "
+            f"AH {fixture['home']} vs {fixture['away']} "
+            f"/ line={line:+.1f} "
+            f"/ {selected['bookmaker']} "
             f"/ {selected['home']} - {selected['away']}"
         )
 
         result[f"home_ah_{line:+.1f}"] = selected["home"]
+
         result[f"away_ah_{-line:+.1f}"] = selected["away"]
 
     return result
@@ -339,11 +439,15 @@ def empty_ah_result(fixture):
 
     result["home_ah_-0.5"] = fixture["home_ml"]
     result["home_ah_+0.5"] = fixture["home_ml"]
+
     result["away_ah_-0.5"] = fixture["away_ml"]
     result["away_ah_+0.5"] = fixture["away_ml"]
 
     return result
 
+# =====================
+# Google Sheets
+# =====================
 
 def get_gspread_client():
     credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -363,7 +467,9 @@ def get_gspread_client():
 
         return gspread.authorize(creds)
 
-    return gspread.service_account(filename="credentials.json")
+    return gspread.service_account(
+        filename="credentials.json"
+    )
 
 
 def get_worksheet_by_gid(spreadsheet, gid):
@@ -376,8 +482,13 @@ def get_worksheet_by_gid(spreadsheet, gid):
 
 def write_to_sheet(data):
     gc = get_gspread_client()
+
     sh = gc.open_by_url(SPREADSHEET_URL)
-    ws = get_worksheet_by_gid(sh, WORKSHEET_GID)
+
+    ws = get_worksheet_by_gid(
+        sh,
+        WORKSHEET_GID
+    )
 
     ws.batch_clear(CLEAR_RANGES)
 
@@ -422,35 +533,71 @@ def write_to_sheet(data):
     if right_values:
         ws.update("J10", right_values)
 
+# =====================
+# Main
+# =====================
 
 def run_job():
     results = []
 
     with sync_playwright() as p:
         browser = launch_browser(p)
+
         page = new_light_page(browser)
 
         try:
             fixtures = get_fixture_rows(page)
 
             for f in fixtures:
-                print(f"{f['start_time_jst']} {f['home']} vs {f['away']}")
+                print(
+                    f"{f['start_time_jst']} "
+                    f"{f['home']} vs {f['away']}"
+                )
 
                 try:
-                    ml = extract_moneyline_odds(page, f)
-                    f = {**f, **ml}
+                    ml = extract_moneyline_odds(
+                        page,
+                        f
+                    )
+
+                    f = {
+                        **f,
+                        **ml
+                    }
+
                 except Exception as e:
-                    print(f"ML取得失敗: {f['home']} vs {f['away']} / {e}")
+                    print(
+                        f"ML取得失敗: "
+                        f"{f['home']} vs {f['away']} "
+                        f"/ {e}"
+                    )
+
                     continue
 
                 try:
-                    ah = extract_ah_odds(page, f)
-                    results.append({**f, **ah})
+                    ah = extract_ah_odds(
+                        page,
+                        f
+                    )
+
+                    results.append({
+                        **f,
+                        **ah
+                    })
 
                 except Exception as e:
-                    print(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
+                    print(
+                        f"AH取得失敗: "
+                        f"{f['home']} vs {f['away']} "
+                        f"/ {e}"
+                    )
+
                     ah = empty_ah_result(f)
-                    results.append({**f, **ah})
+
+                    results.append({
+                        **f,
+                        **ah
+                    })
 
         finally:
             browser.close()
