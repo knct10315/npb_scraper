@@ -239,7 +239,6 @@ def get_fixture_rows(page):
 def extract_moneyline_odds_from_current_page(page, fixture):
     """
     試合詳細ページの現在表示テーブルからMLを取得。
-    MLBでは ROW 0 の BOOKMAKERS 見出し行を除外する必要あり。
     想定セル:
       CELL 0: bookmaker
       CELL 4: home ML
@@ -286,6 +285,12 @@ def extract_moneyline_odds_from_current_page(page, fixture):
             "away_ml": away_ml
         })
 
+    if candidates:
+        print(
+            f"ML候補 {fixture['home']} vs {fixture['away']}: "
+            + ", ".join(c["bookmaker"] for c in candidates)
+        )
+
     if not candidates:
         raise Exception("ML candidate not found")
 
@@ -313,7 +318,7 @@ def extract_moneyline_odds_from_current_page(page, fixture):
 def ah_lines_visible(page):
     rows = page.locator("table tr").all()
 
-    for row in rows[:40]:
+    for row in rows[:60]:
         text = row.inner_text()
 
         if (
@@ -329,10 +334,20 @@ def ah_lines_visible(page):
     return False
 
 
-def ensure_ah_tab(page):
+def wait_until_ah_loaded(page):
+    for _ in range(12):
+        if ah_lines_visible(page):
+            return True
+
+        page.wait_for_timeout(1000)
+
+    return False
+
+
+def ensure_ah_tab(page, ah_url):
     page.wait_for_timeout(1000)
 
-    if ah_lines_visible(page):
+    if wait_until_ah_loaded(page):
         return
 
     ah_selectors = [
@@ -343,29 +358,33 @@ def ensure_ah_tab(page):
     for selector in ah_selectors:
         try:
             page.locator(selector).first.click(timeout=5000)
-            page.wait_for_timeout(3000)
 
-            if ah_lines_visible(page):
+            if wait_until_ah_loaded(page):
                 return
 
         except Exception:
             pass
 
-    # URLハッシュを直接変えてみる
+    # 同一ページで切替不可なら、ah_urlへ直接アクセス
     try:
-        current_url = page.url.split("#")[0]
-        page.goto(
-            current_url + "#ah",
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-        page.wait_for_timeout(3000)
+        safe_goto(page, ah_url)
 
-        if ah_lines_visible(page):
+        if wait_until_ah_loaded(page):
             return
 
     except Exception:
         pass
+
+    # 直接アクセス後もダメなら、もう一度クリックを試す
+    for selector in ah_selectors:
+        try:
+            page.locator(selector).first.click(timeout=5000)
+
+            if wait_until_ah_loaded(page):
+                return
+
+        except Exception:
+            pass
 
     raise Exception("AH tab not visible")
 
@@ -384,7 +403,7 @@ def extract_ah_odds_from_current_page(page, fixture):
       CELL 6: away odds
     """
 
-    ensure_ah_tab(page)
+    ensure_ah_tab(page, fixture["ah_url"])
 
     rows = page.locator("table tr").all()
 
@@ -436,6 +455,14 @@ def extract_ah_odds_from_current_page(page, fixture):
             "away": away_odds
         })
 
+    for line in HANDICAP_LINES:
+        if candidates[line]:
+            print(
+                f"AH候補 {fixture['home']} vs {fixture['away']} "
+                f"{line:+.1f}: "
+                + ", ".join(c["bookmaker"] for c in candidates[line])
+            )
+
     result = {}
 
     for line in HANDICAP_LINES:
@@ -483,11 +510,11 @@ def empty_ah_result(fixture):
         result[f"home_ah_{line:+.1f}"] = ""
         result[f"away_ah_{line:+.1f}"] = ""
 
-    result["home_ah_-0.5"] = fixture["home_ml"]
-    result["home_ah_+0.5"] = fixture["home_ml"]
+    result["home_ah_-0.5"] = fixture.get("home_ml", "")
+    result["home_ah_+0.5"] = fixture.get("home_ml", "")
 
-    result["away_ah_-0.5"] = fixture["away_ml"]
-    result["away_ah_+0.5"] = fixture["away_ml"]
+    result["away_ah_-0.5"] = fixture.get("away_ml", "")
+    result["away_ah_+0.5"] = fixture.get("away_ml", "")
 
     return result
 
@@ -602,7 +629,7 @@ def run_job():
                 )
 
                 try:
-                    # 試合ページは1回だけ開く
+                    # 試合ページを開く
                     safe_goto(page, f["match_url"])
 
                     ml = extract_moneyline_odds_from_current_page(
@@ -621,10 +648,25 @@ def run_job():
                         f"{f['home']} vs {f['away']} "
                         f"/ {e}"
                     )
+
+                    # ML失敗でも試合行は残す
+                    f = {
+                        **f,
+                        "home_ml": "",
+                        "away_ml": ""
+                    }
+
+                    ah = empty_ah_result(f)
+
+                    results.append({
+                        **f,
+                        **ah
+                    })
+
                     continue
 
                 try:
-                    # 同じページ上でAHタブに切り替えて取得
+                    # 同じページ上でAHタブに切り替え。失敗時はah_urlへ再アクセス。
                     ah = extract_ah_odds_from_current_page(
                         page,
                         f
