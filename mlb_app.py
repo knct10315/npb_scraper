@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import re
 import os
 import json
+import time
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -17,6 +18,8 @@ HEADLESS = True
 TARGET_HOURS = 48
 LEAGUE_NAME = "MLB"
 
+CHUNK_SIZE = 3
+
 HANDICAP_LINES = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
 
 CLEAR_RANGES = [
@@ -24,7 +27,11 @@ CLEAR_RANGES = [
     "J10:AA70",
 ]
 
-BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
+BLOCK_RESOURCE_TYPES = {"image", "font", "media", "stylesheet"}
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def normalize_text(text):
@@ -91,6 +98,8 @@ def launch_browser(playwright):
             "--mute-audio",
             "--no-first-run",
             "--disable-default-apps",
+            "--aggressive-cache-discard",
+            "--disable-cache",
         ]
     )
 
@@ -105,18 +114,25 @@ def new_light_page(browser):
             route.continue_()
 
     page.route("**/*", block_heavy_resources)
-
     return page
 
 
 def safe_goto(page, url):
-    page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(1500)
+    start = time.time()
+
+    page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=30000
+    )
 
     try:
-        page.wait_for_selector("table", timeout=20000)
+        page.wait_for_selector("table", timeout=12000)
     except TimeoutError:
         raise Exception(f"table not found: {url}")
+
+    elapsed = time.time() - start
+    log(f"loaded {elapsed:.1f}s: {url}")
 
 
 def get_fixture_rows(page):
@@ -177,12 +193,12 @@ def get_fixture_rows(page):
             "ah_url": BASE_URL + href + "#ah"
         })
 
+    log(f"fixtures: {len(fixtures)}")
     return fixtures
 
 
 def extract_moneyline_odds_from_current_page(page, fixture):
     rows = page.locator("table tr").all()
-
     candidates = []
 
     for row in rows:
@@ -192,7 +208,6 @@ def extract_moneyline_odds_from_current_page(page, fixture):
             continue
 
         texts = [c.inner_text().strip() for c in cells]
-
         bookmaker = texts[0]
 
         if not bookmaker:
@@ -222,7 +237,7 @@ def extract_moneyline_odds_from_current_page(page, fixture):
 
     selected = next((c for c in candidates if c["is_bia"]), candidates[0])
 
-    print(
+    log(
         f"ML {fixture['home']} vs {fixture['away']} "
         f"/ {selected['bookmaker']} "
         f"/ {selected['home_ml']} - {selected['away_ml']}"
@@ -254,17 +269,16 @@ def ah_lines_visible(page):
 
 
 def wait_until_ah_loaded(page):
-    for _ in range(8):
+    for _ in range(5):
         if ah_lines_visible(page):
             return True
-        page.wait_for_timeout(1000)
+
+        page.wait_for_timeout(800)
 
     return False
 
 
 def ensure_ah_tab(page, ah_url):
-    page.wait_for_timeout(1000)
-
     if wait_until_ah_loaded(page):
         return
 
@@ -275,7 +289,7 @@ def ensure_ah_tab(page, ah_url):
 
     for selector in ah_selectors:
         try:
-            page.locator(selector).first.click(timeout=4000)
+            page.locator(selector).first.click(timeout=3000)
 
             if wait_until_ah_loaded(page):
                 return
@@ -284,8 +298,8 @@ def ensure_ah_tab(page, ah_url):
             pass
 
     try:
-        page.goto(ah_url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(2000)
+        page.goto(ah_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_selector("table", timeout=12000)
 
         if wait_until_ah_loaded(page):
             return
@@ -295,7 +309,7 @@ def ensure_ah_tab(page, ah_url):
 
     for selector in ah_selectors:
         try:
-            page.locator(selector).first.click(timeout=4000)
+            page.locator(selector).first.click(timeout=3000)
 
             if wait_until_ah_loaded(page):
                 return
@@ -310,7 +324,6 @@ def extract_ah_odds_from_current_page(page, fixture):
     ensure_ah_tab(page, fixture["ah_url"])
 
     rows = page.locator("table tr").all()
-
     candidates = {line: [] for line in HANDICAP_LINES}
 
     for row in rows:
@@ -320,7 +333,6 @@ def extract_ah_odds_from_current_page(page, fixture):
             continue
 
         texts = [c.inner_text().strip() for c in cells]
-
         bookmaker = texts[0]
 
         if not bookmaker:
@@ -373,7 +385,7 @@ def extract_ah_odds_from_current_page(page, fixture):
 
         selected = next((c for c in candidates[line] if c["is_bia"]), candidates[line][0])
 
-        print(
+        log(
             f"AH {fixture['home']} vs {fixture['away']} "
             f"/ line={line:+.1f} "
             f"/ {selected['bookmaker']} "
@@ -479,53 +491,76 @@ def write_to_sheet(data):
         ws.update("J10", right_values)
 
 
+def process_fixture(page, f):
+    log(f"start {f['home']} vs {f['away']}")
+
+    start = time.time()
+
+    try:
+        safe_goto(page, f["match_url"])
+        ml = extract_moneyline_odds_from_current_page(page, f)
+        f = {**f, **ml}
+
+    except Exception as e:
+        log(f"ML取得失敗: {f['home']} vs {f['away']} / {e}")
+
+        f = {
+            **f,
+            "home_ml": "",
+            "away_ml": ""
+        }
+
+        ah = empty_ah_result(f)
+        return {**f, **ah}
+
+    try:
+        ah = extract_ah_odds_from_current_page(page, f)
+        result = {**f, **ah}
+
+    except Exception as e:
+        log(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
+        ah = empty_ah_result(f)
+        result = {**f, **ah}
+
+    elapsed = time.time() - start
+    log(f"done {f['home']} vs {f['away']} / {elapsed:.1f}s")
+
+    return result
+
+
 def run_job():
     results = []
 
+    total_start = time.time()
+
     with sync_playwright() as p:
+        # fixtures取得用ブラウザ
         browser = launch_browser(p)
         page = new_light_page(browser)
 
         try:
             fixtures = get_fixture_rows(page)
-
-            for f in fixtures:
-                print(f"{f['start_time_jst']} {f['home']} vs {f['away']}")
-
-                try:
-                    safe_goto(page, f["match_url"])
-
-                    ml = extract_moneyline_odds_from_current_page(page, f)
-
-                    f = {**f, **ml}
-
-                except Exception as e:
-                    print(f"ML取得失敗: {f['home']} vs {f['away']} / {e}")
-
-                    f = {
-                        **f,
-                        "home_ml": "",
-                        "away_ml": ""
-                    }
-
-                    ah = empty_ah_result(f)
-
-                    results.append({**f, **ah})
-
-                    continue
-
-                try:
-                    ah = extract_ah_odds_from_current_page(page, f)
-                    results.append({**f, **ah})
-
-                except Exception as e:
-                    print(f"AH取得失敗: {f['home']} vs {f['away']} / {e}")
-                    ah = empty_ah_result(f)
-                    results.append({**f, **ah})
-
         finally:
             browser.close()
 
+        for i in range(0, len(fixtures), CHUNK_SIZE):
+            chunk = fixtures[i:i + CHUNK_SIZE]
+
+            log(f"chunk start {i + 1}-{i + len(chunk)} / {len(fixtures)}")
+
+            browser = launch_browser(p)
+            page = new_light_page(browser)
+
+            try:
+                for f in chunk:
+                    results.append(process_fixture(page, f))
+            finally:
+                browser.close()
+                log("browser restarted")
+
     write_to_sheet(results)
+
+    total_elapsed = time.time() - total_start
+    log(f"完了: {len(results)} 件 / {total_elapsed:.1f}s")
 
     return results
