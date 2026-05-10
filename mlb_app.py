@@ -57,6 +57,7 @@ def parse_betexplorer_datetime(date_label, time_text):
         m = re.match(r"(\d{1,2})\.(\d{1,2})\.", date_label)
         if not m:
             return None
+
         day = int(m.group(1))
         month = int(m.group(2))
         base_date = datetime(now.year, month, day).date()
@@ -109,11 +110,11 @@ def new_light_page(browser):
 
 
 def safe_goto(page, url):
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(2000)
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(1500)
 
     try:
-        page.wait_for_selector("table", timeout=30000)
+        page.wait_for_selector("table", timeout=20000)
     except TimeoutError:
         raise Exception(f"table not found: {url}")
 
@@ -162,6 +163,11 @@ def get_fixture_rows(page):
         if not is_within_target_hours(start_time):
             continue
 
+        decimal_numbers = re.findall(r"\d+\.\d+", text)
+
+        if len(decimal_numbers) < 2:
+            continue
+
         fixtures.append({
             "league": LEAGUE_NAME,
             "start_time_jst": start_time.strftime("%Y-%m-%d %H:%M"),
@@ -174,9 +180,7 @@ def get_fixture_rows(page):
     return fixtures
 
 
-def extract_moneyline_odds(page, fixture):
-    safe_goto(page, fixture["match_url"])
-
+def extract_moneyline_odds_from_current_page(page, fixture):
     rows = page.locator("table tr").all()
 
     candidates = []
@@ -233,7 +237,7 @@ def extract_moneyline_odds(page, fixture):
 def ah_lines_visible(page):
     rows = page.locator("table tr").all()
 
-    for row in rows[:60]:
+    for row in rows[:80]:
         text = row.inner_text()
 
         if (
@@ -249,10 +253,19 @@ def ah_lines_visible(page):
     return False
 
 
-def ensure_ah_tab(page):
-    page.wait_for_timeout(2000)
+def wait_until_ah_loaded(page):
+    for _ in range(8):
+        if ah_lines_visible(page):
+            return True
+        page.wait_for_timeout(1000)
 
-    if ah_lines_visible(page):
+    return False
+
+
+def ensure_ah_tab(page, ah_url):
+    page.wait_for_timeout(1000)
+
+    if wait_until_ah_loaded(page):
         return
 
     ah_selectors = [
@@ -262,20 +275,39 @@ def ensure_ah_tab(page):
 
     for selector in ah_selectors:
         try:
-            page.locator(selector).first.click(timeout=3000)
-            page.wait_for_timeout(3000)
+            page.locator(selector).first.click(timeout=4000)
 
-            if ah_lines_visible(page):
+            if wait_until_ah_loaded(page):
                 return
 
         except Exception:
             pass
 
+    try:
+        page.goto(ah_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2000)
 
-def extract_ah_odds(page, fixture):
-    safe_goto(page, fixture["ah_url"])
+        if wait_until_ah_loaded(page):
+            return
 
-    ensure_ah_tab(page)
+    except Exception:
+        pass
+
+    for selector in ah_selectors:
+        try:
+            page.locator(selector).first.click(timeout=4000)
+
+            if wait_until_ah_loaded(page):
+                return
+
+        except Exception:
+            pass
+
+    raise Exception("AH tab not visible")
+
+
+def extract_ah_odds_from_current_page(page, fixture):
+    ensure_ah_tab(page, fixture["ah_url"])
 
     rows = page.locator("table tr").all()
 
@@ -461,7 +493,10 @@ def run_job():
                 print(f"{f['start_time_jst']} {f['home']} vs {f['away']}")
 
                 try:
-                    ml = extract_moneyline_odds(page, f)
+                    safe_goto(page, f["match_url"])
+
+                    ml = extract_moneyline_odds_from_current_page(page, f)
+
                     f = {**f, **ml}
 
                 except Exception as e:
@@ -475,15 +510,12 @@ def run_job():
 
                     ah = empty_ah_result(f)
 
-                    results.append({
-                        **f,
-                        **ah
-                    })
+                    results.append({**f, **ah})
 
                     continue
 
                 try:
-                    ah = extract_ah_odds(page, f)
+                    ah = extract_ah_odds_from_current_page(page, f)
                     results.append({**f, **ah})
 
                 except Exception as e:
