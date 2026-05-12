@@ -53,6 +53,15 @@ def is_valid_decimal_odds(value):
     return value is not None and 1.01 < value <= 20
 
 
+def get_cell_texts(row):
+    try:
+        return row.locator("th, td").evaluate_all(
+            "(els) => els.map(e => e.innerText.trim())"
+        )
+    except Exception:
+        return []
+
+
 def parse_betexplorer_datetime(date_label, time_text):
     now = datetime.now()
 
@@ -145,7 +154,10 @@ def get_fixture_rows(page):
     last_time_text = None
 
     for row in rows:
-        text = row.inner_text().strip()
+        try:
+            text = row.inner_text().strip()
+        except Exception:
+            continue
 
         if " - " not in text:
             continue
@@ -202,12 +214,11 @@ def extract_moneyline_odds_from_current_page(page, fixture):
     candidates = []
 
     for row in rows:
-        cells = row.locator("th, td").all()
+        texts = get_cell_texts(row)
 
-        if len(cells) < 6:
+        if len(texts) < 6:
             continue
 
-        texts = [c.inner_text().strip() for c in cells]
         bookmaker = texts[0]
 
         if not bookmaker:
@@ -253,7 +264,10 @@ def ah_lines_visible(page):
     rows = page.locator("table tr").all()
 
     for row in rows[:80]:
-        text = row.inner_text()
+        try:
+            text = row.inner_text(timeout=3000)
+        except Exception:
+            continue
 
         if (
             "-1.5" in text
@@ -327,12 +341,11 @@ def extract_ah_odds_from_current_page(page, fixture):
     candidates = {line: [] for line in HANDICAP_LINES}
 
     for row in rows:
-        cells = row.locator("th, td").all()
+        texts = get_cell_texts(row)
 
-        if len(cells) < 7:
+        if len(texts) < 7:
             continue
 
-        texts = [c.inner_text().strip() for c in cells]
         bookmaker = texts[0]
 
         if not bookmaker:
@@ -534,7 +547,6 @@ def run_job():
     total_start = time.time()
 
     with sync_playwright() as p:
-        # fixtures取得用ブラウザ
         browser = launch_browser(p)
         page = new_light_page(browser)
 
