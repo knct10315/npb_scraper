@@ -29,6 +29,31 @@ CLEAR_RANGES = [
 
 BLOCK_RESOURCE_TYPES = {"image", "font", "media", "stylesheet"}
 
+KNOWN_BOOKMAKER_KEYWORDS = [
+    "bet",
+    "bet365",
+    "betinasia",
+    "pinnacle",
+    "1xbet",
+    "888sport",
+    "unibet",
+    "williamhill",
+    "stake",
+    "bwin",
+    "betfair",
+    "betmgm",
+    "draftkings",
+    "fanduel",
+    "caesars",
+    "pointsbet",
+    "betrivers",
+    "duelbits",
+    "roobet",
+    "n1bet",
+    "megapari",
+    "mozzartbet",
+]
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -40,6 +65,18 @@ def normalize_text(text):
 
 def is_bet_in_asia(text):
     return "betinasia" in normalize_text(text)
+
+
+def looks_like_bookmaker(name):
+    n = normalize_text(name)
+
+    if not n:
+        return False
+
+    if "bookmakers" in n:
+        return False
+
+    return any(k in n for k in KNOWN_BOOKMAKER_KEYWORDS)
 
 
 def parse_float(value):
@@ -209,7 +246,27 @@ def get_fixture_rows(page):
     return fixtures
 
 
-def extract_moneyline_odds_from_current_page(page, fixture):
+def try_show_moneyline_tab(page):
+    selectors = [
+        "text=Match Winner",
+        "text=Moneyline",
+        "text=1x2",
+        "text=1X2",
+        "text=Odds",
+    ]
+
+    for selector in selectors:
+        try:
+            page.locator(selector).first.click(timeout=2500)
+            page.wait_for_timeout(1500)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def extract_moneyline_odds_from_current_page(page, fixture, retry=True):
     rows = page.locator("table tr").all()
     candidates = []
 
@@ -221,21 +278,16 @@ def extract_moneyline_odds_from_current_page(page, fixture):
 
         bookmaker = texts[0]
 
-        if not bookmaker:
-            continue
-
-        if "bookmakers" in bookmaker.lower():
+        if not looks_like_bookmaker(bookmaker):
             continue
 
         home_ml = None
         away_ml = None
 
-        # 通常パターン: CELL 4 / CELL 5
         if len(texts) >= 6:
             home_ml = parse_float(texts[4])
             away_ml = parse_float(texts[5])
 
-        # fallback: 行全体からオッズらしい数字を拾う
         if not is_valid_decimal_odds(home_ml) or not is_valid_decimal_odds(away_ml):
             row_text = " ".join(texts)
             nums = []
@@ -263,9 +315,15 @@ def extract_moneyline_odds_from_current_page(page, fixture):
             "away_ml": away_ml
         })
 
+    if not candidates and retry:
+        log(f"ML候補なし・MLタブ再試行: {fixture['home']} vs {fixture['away']}")
+
+        try_show_moneyline_tab(page)
+        return extract_moneyline_odds_from_current_page(page, fixture, retry=False)
+
     if not candidates:
-        # 原因調査用に最初の数行だけログ出力
         log(f"ML候補なし: {fixture['home']} vs {fixture['away']}")
+
         for i, row in enumerate(rows[:8]):
             texts = get_cell_texts(row)
             log(f"ML DEBUG ROW {i}: {texts}")
@@ -284,6 +342,7 @@ def extract_moneyline_odds_from_current_page(page, fixture):
         "home_ml": selected["home_ml"],
         "away_ml": selected["away_ml"]
     }
+
 
 def ah_lines_visible(page):
     rows = page.locator("table tr").all()
@@ -368,27 +427,25 @@ def extract_ah_odds_from_current_page(page, fixture):
     for row in rows:
         texts = get_cell_texts(row)
 
-        if len(texts) < 7:
+        if len(texts) < 2:
             continue
 
         bookmaker = texts[0]
 
-        if not bookmaker:
+        if not looks_like_bookmaker(bookmaker):
             continue
 
-        if "bookmakers" in bookmaker.lower():
+        line = None
+        home_odds = None
+        away_odds = None
+
+        if len(texts) >= 7:
+            line = parse_float(texts[4])
+            home_odds = parse_float(texts[5])
+            away_odds = parse_float(texts[6])
+
+        if line is None or line not in HANDICAP_LINES:
             continue
-
-        line = parse_float(texts[4])
-
-        if line is None:
-            continue
-
-        if line not in HANDICAP_LINES:
-            continue
-
-        home_odds = parse_float(texts[5])
-        away_odds = parse_float(texts[6])
 
         if not is_valid_decimal_odds(home_odds):
             continue
