@@ -246,10 +246,46 @@ def get_fixture_rows(page):
     return fixtures
 
 
+# =====================
+# ML / Home-Away
+# =====================
+
+def moneyline_rows_visible(page):
+    rows = page.locator("table tr").all()
+
+    for row in rows[:40]:
+        texts = get_cell_texts(row)
+
+        if len(texts) >= 6:
+            bookmaker = texts[0]
+
+            if not looks_like_bookmaker(bookmaker):
+                continue
+
+            home_ml = parse_float(texts[4])
+            away_ml = parse_float(texts[5])
+
+            if is_valid_decimal_odds(home_ml) and is_valid_decimal_odds(away_ml):
+                return True
+
+    return False
+
+
+def wait_until_moneyline_loaded(page):
+    for _ in range(10):
+        if moneyline_rows_visible(page):
+            return True
+
+        page.wait_for_timeout(1000)
+
+    return False
+
+
 def try_show_moneyline_tab(page):
     selectors = [
-        "text=Match Winner",
+        "text=Home/Away",
         "text=Moneyline",
+        "text=Match Winner",
         "text=1x2",
         "text=1X2",
         "text=Odds",
@@ -257,9 +293,12 @@ def try_show_moneyline_tab(page):
 
     for selector in selectors:
         try:
-            page.locator(selector).first.click(timeout=2500)
-            page.wait_for_timeout(1500)
-            return True
+            page.locator(selector).first.click(timeout=5000)
+            page.wait_for_timeout(3000)
+
+            if moneyline_rows_visible(page):
+                return True
+
         except Exception:
             pass
 
@@ -267,6 +306,8 @@ def try_show_moneyline_tab(page):
 
 
 def extract_moneyline_odds_from_current_page(page, fixture, retry=True):
+    wait_until_moneyline_loaded(page)
+
     rows = page.locator("table tr").all()
     candidates = []
 
@@ -316,9 +357,11 @@ def extract_moneyline_odds_from_current_page(page, fixture, retry=True):
         })
 
     if not candidates and retry:
-        log(f"ML候補なし・MLタブ再試行: {fixture['home']} vs {fixture['away']}")
+        log(f"ML候補なし・Home/Away再試行: {fixture['home']} vs {fixture['away']}")
 
         try_show_moneyline_tab(page)
+        wait_until_moneyline_loaded(page)
+
         return extract_moneyline_odds_from_current_page(page, fixture, retry=False)
 
     if not candidates:
@@ -343,6 +386,10 @@ def extract_moneyline_odds_from_current_page(page, fixture, retry=True):
         "away_ml": selected["away_ml"]
     }
 
+
+# =====================
+# AH
+# =====================
 
 def ah_lines_visible(page):
     rows = page.locator("table tr").all()
@@ -381,8 +428,8 @@ def ensure_ah_tab(page, ah_url):
         return
 
     ah_selectors = [
-        "text=Asian Handicap",
         "text=AH",
+        "text=Asian Handicap",
     ]
 
     for selector in ah_selectors:
@@ -508,6 +555,10 @@ def empty_ah_result(fixture):
     return result
 
 
+# =====================
+# Google Sheets
+# =====================
+
 def get_gspread_client():
     credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
 
@@ -585,6 +636,10 @@ def write_to_sheet(data):
     if right_values:
         ws.update("J10", right_values)
 
+
+# =====================
+# Main
+# =====================
 
 def process_fixture(page, f):
     log(f"start {f['home']} vs {f['away']}")
