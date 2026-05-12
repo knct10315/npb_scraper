@@ -216,7 +216,7 @@ def extract_moneyline_odds_from_current_page(page, fixture):
     for row in rows:
         texts = get_cell_texts(row)
 
-        if len(texts) < 6:
+        if len(texts) < 2:
             continue
 
         bookmaker = texts[0]
@@ -227,8 +227,28 @@ def extract_moneyline_odds_from_current_page(page, fixture):
         if "bookmakers" in bookmaker.lower():
             continue
 
-        home_ml = parse_float(texts[4])
-        away_ml = parse_float(texts[5])
+        home_ml = None
+        away_ml = None
+
+        # 通常パターン: CELL 4 / CELL 5
+        if len(texts) >= 6:
+            home_ml = parse_float(texts[4])
+            away_ml = parse_float(texts[5])
+
+        # fallback: 行全体からオッズらしい数字を拾う
+        if not is_valid_decimal_odds(home_ml) or not is_valid_decimal_odds(away_ml):
+            row_text = " ".join(texts)
+            nums = []
+
+            for n in re.findall(r"\d+\.\d+", row_text):
+                v = parse_float(n)
+
+                if is_valid_decimal_odds(v):
+                    nums.append(v)
+
+            if len(nums) >= 2:
+                home_ml = nums[-2]
+                away_ml = nums[-1]
 
         if not is_valid_decimal_odds(home_ml):
             continue
@@ -244,6 +264,12 @@ def extract_moneyline_odds_from_current_page(page, fixture):
         })
 
     if not candidates:
+        # 原因調査用に最初の数行だけログ出力
+        log(f"ML候補なし: {fixture['home']} vs {fixture['away']}")
+        for i, row in enumerate(rows[:8]):
+            texts = get_cell_texts(row)
+            log(f"ML DEBUG ROW {i}: {texts}")
+
         raise Exception("ML candidate not found")
 
     selected = next((c for c in candidates if c["is_bia"]), candidates[0])
@@ -258,7 +284,6 @@ def extract_moneyline_odds_from_current_page(page, fixture):
         "home_ml": selected["home_ml"],
         "away_ml": selected["away_ml"]
     }
-
 
 def ah_lines_visible(page):
     rows = page.locator("table tr").all()
