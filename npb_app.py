@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_ai_extract_only_v4_20260517"
+CODE_VERSION = "npb_match_blocks_v5_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -590,6 +590,73 @@ def normalize_extracted_lines_text(text):
     return "\n".join(lines).strip()
 
 
+def is_time_line(line):
+    return bool(re.fullmatch(r"\d{1,2}:\d{2}", str(line).strip()))
+
+
+def build_match_blocks(text):
+    """
+    抽出済みテキストを、原則「チーム行 / 時刻行 / チーム行」の試合ブロックへ分割する。
+    行の内容自体は変更しない。ブロック化できない残り行は最後にまとめて残す。
+    """
+    lines = [
+        str(line).strip()
+        for line in str(text).splitlines()
+        if str(line).strip()
+    ]
+
+    blocks = []
+    current = []
+
+    for line in lines:
+        current.append(line)
+
+        has_time = any(is_time_line(x) for x in current)
+
+        # 基本形: チーム / 時刻 / チーム
+        # 時刻行の後に1行以上来たら、1試合として区切る
+        if has_time and len(current) >= 3 and not is_time_line(current[-1]):
+            blocks.append(current)
+            current = []
+
+    if current:
+        blocks.append(current)
+
+    return blocks
+
+
+def format_blocks_for_sheet(text):
+    """
+    入力シートへ戻す表示用。
+    試合ブロックごとに1行空欄を入れ、目視確認しやすくする。
+    """
+    blocks = build_match_blocks(text)
+
+    values = []
+    for block_index, block in enumerate(blocks):
+        if block_index > 0:
+            values.append([""])
+
+        for line in block:
+            values.append([line])
+
+    return values
+
+
+def format_blocks_for_ai(text):
+    """
+    AI解析用。
+    MATCH番号を付けて、試合ごとの境界を明確にする。
+    """
+    blocks = build_match_blocks(text)
+
+    parts = []
+    for i, block in enumerate(blocks, start=1):
+        parts.append(f"MATCH {i}:\n" + "\n".join(block))
+
+    return "\n\n".join(parts).strip()
+
+
 def extract_relevant_handicap_lines_with_openai(raw_text):
     """
     胴元原文から必要行だけを抜き出す。
@@ -684,13 +751,12 @@ def write_formatted_handicap_input(spreadsheet, formatted_text):
         ws = get_worksheet_by_gid(spreadsheet, HANDICAP_INPUT_GID)
         ws.batch_clear(["A1:Z100"])
 
-        lines = normalize_extracted_lines_text(formatted_text).splitlines()
-        values = [[line] for line in lines if line.strip()]
+        values = format_blocks_for_sheet(formatted_text)
 
         if values:
             ws.update("A1", values)
 
-        log("ハンデ入力シートを抽出済みテキストへ更新")
+        log("ハンデ入力シートを試合ごと空行区切りで更新")
     except Exception as e:
         log(f"ハンデ入力シート更新失敗: {e}")
 
@@ -734,8 +800,10 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
         log("ハンデ入力テキストなし")
         return []
 
+    ai_block_text = format_blocks_for_ai(formatted_text)
+
     log("ハンデ入力テキスト解析対象:")
-    log(formatted_text)
+    log(ai_block_text)
 
     match_lines = []
 
@@ -762,8 +830,12 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
 - 許可リストにない値は絶対に出力しないでください。
 - <> が付いているチームがハンデを受けている側です。
 - <...> が付いている行のチームを絶対に逆にしてはいけません。
-- homeチームに <> が付いていれば home側の値。
-- awayチームに <> が付いていれば away側の値。
+- home/awayは、胴元メッセージ内の上下順ではなく、必ず「現在の試合一覧」の home / away 列で判定してください。
+- 現在の試合一覧では "A vs B" の左側Aがhome、右側Bがawayです。
+- 胴元メッセージの同じMATCHブロック内で、現在の試合一覧のhomeチームに <> が付いていれば home側の値。
+- 胴元メッセージの同じMATCHブロック内で、現在の試合一覧のawayチームに <> が付いていれば away側の値。
+- 胴元メッセージの上に書かれているチームがhomeとは限りません。
+- 胴元メッセージの下に書かれているチームがawayとは限りません。
 - <05> は 0.5、<04> は 0.4、<03> は 0.3、<1.2> は 1.2 と解釈。
 - <0半> は 0半、<1半3> は 1半3 のように、半を含む表記は小数に変換せず、許可リストの形式で出力してください。
 - 時刻行だけで試合を判断しないでください。
@@ -779,8 +851,8 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
 許可されるhandicap値:
 {allowed_values_text}
 
-抽出済み胴元メッセージ:
-{formatted_text}
+MATCH番号付き抽出済み胴元メッセージ:
+{ai_block_text}
 """
 
     try:
