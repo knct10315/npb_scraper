@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_python_decides_handicap_v6_20260517"
+CODE_VERSION = "npb_dictionary_match_v7_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -89,6 +89,111 @@ DeNA = Yokohama BayStars
 オリックス = Orix Buffaloes
 バファローズ = Orix Buffaloes
 """
+
+NPB_TEAM_ALIASES = {
+    "Yomiuri Giants": [
+        "巨人", "読売", "読売巨人", "読売ジャイアンツ", "ジャイアンツ", "GIANTS",
+        "Giants", "Yomiuri", "Yomiuri Giants", "YG", "兎",
+    ],
+    "Yokohama BayStars": [
+        "横浜", "横浜dena", "dena", "denaベイスターズ", "横浜denaベイスターズ",
+        "ベイスターズ", "baystars", "BayStars", "Yokohama", "Yokohama BayStars",
+        "DeNA", "ＤｅＮＡ", "ＤＥＮＡ", "DNA",
+    ],
+    "Hanshin Tigers": [
+        "阪神", "阪神タイガース", "タイガース", "Tigers", "Hanshin",
+        "Hanshin Tigers", "虎",
+    ],
+    "Hiroshima Carp": [
+        "広島", "広島東洋", "広島東洋カープ", "カープ", "Carp", "Hiroshima",
+        "Hiroshima Carp", "鯉",
+    ],
+    "Chunichi Dragons": [
+        "中日", "中日ドラゴンズ", "ドラゴンズ", "Dragons", "Chunichi",
+        "Chunichi Dragons", "竜",
+    ],
+    "Yakult Swallows": [
+        "ヤクルト", "東京ヤクルト", "東京ヤクルトスワローズ", "スワローズ",
+        "Yakult", "Swallows", "Yakult Swallows", "燕",
+    ],
+    "Nippon Ham Fighters": [
+        "日本ハム", "日ハム", "ハム", "北海道日本ハム", "北海道日本ハムファイターズ",
+        "ファイターズ", "Fighters", "Nippon Ham", "NipponHam", "Nippon Ham Fighters",
+        "日公",
+    ],
+    "Seibu Lions": [
+        "西武", "埼玉西武", "埼玉西武ライオンズ", "ライオンズ", "Lions",
+        "Seibu", "Seibu Lions", "獅子",
+    ],
+    "Rakuten Gold. Eagles": [
+        "楽天", "東北楽天", "東北楽天ゴールデンイーグルス", "楽天イーグルス",
+        "イーグルス", "ゴールデンイーグルス", "Rakuten", "Eagles",
+        "Golden Eagles", "Rakuten Eagles", "Rakuten Gold. Eagles", "Rakuten Golden Eagles",
+    ],
+    "Fukuoka S. Hawks": [
+        "ソフト", "ソフトバンク", "福岡ソフトバンク", "福岡ソフトバンクホークス",
+        "ホークス", "SB", "SoftBank", "Softbank", "Hawks", "S. Hawks",
+        "Fukuoka S. Hawks", "Fukuoka SoftBank Hawks", "鷹",
+    ],
+    "Chiba Lotte Marines": [
+        "ロッテ", "千葉ロッテ", "千葉ロッテマリーンズ", "マリーンズ",
+        "Lotte", "Marines", "Chiba Lotte", "Chiba Lotte Marines", "鴎",
+    ],
+    "Orix Buffaloes": [
+        "オリックス", "オリ", "オリク", "オリックスバファローズ", "バファローズ",
+        "バッファローズ", "Buffaloes", "Buffalo", "Orix", "Orix Buffaloes", "檻",
+    ],
+}
+
+
+def normalize_team_key(text):
+    s = str(text).strip()
+    s = s.replace("　", "").replace(" ", "")
+    s = s.replace("・", "").replace(".", "").replace("．", "")
+    s = s.replace("ー", "-").replace("－", "-")
+    s = s.lower()
+    s = re.sub(r"[^0-9a-zぁ-んァ-ン一-龥]", "", s)
+    return s
+
+
+TEAM_ALIAS_TO_CANONICAL = {}
+
+for canonical, aliases in NPB_TEAM_ALIASES.items():
+    TEAM_ALIAS_TO_CANONICAL[normalize_team_key(canonical)] = canonical
+    for alias in aliases:
+        TEAM_ALIAS_TO_CANONICAL[normalize_team_key(alias)] = canonical
+
+
+def identify_npb_team(team_text):
+    """
+    胴元側の日本語/略称チーム名を、BetExplorer表記に寄せたcanonical名へ変換する。
+    まず完全一致、次に部分一致。
+    曖昧な場合はNone。
+    """
+    key = normalize_team_key(team_text)
+
+    if not key:
+        return None
+
+    if key in TEAM_ALIAS_TO_CANONICAL:
+        return TEAM_ALIAS_TO_CANONICAL[key]
+
+    matches = []
+
+    # aliasが含まれる / aliasに含まれる の両方を見る
+    for alias_key, canonical in TEAM_ALIAS_TO_CANONICAL.items():
+        if not alias_key:
+            continue
+
+        if alias_key in key or key in alias_key:
+            matches.append(canonical)
+
+    unique = sorted(set(matches))
+
+    if len(unique) == 1:
+        return unique[0]
+
+    return None
 
 
 def log(msg):
@@ -883,108 +988,121 @@ def extract_handicap_blocks(formatted_text):
     return extracted
 
 
-def match_handicap_blocks_with_openai(blocks, fixtures):
+def match_handicap_blocks_with_python(blocks, fixtures):
     """
-    AIには、ハンデ付きチームが現在の試合一覧のどのrowのhome/awayかだけを判定させる。
-    ハンデ数値はPythonで抽出済みのものを使う。
+    NPB用。AIを使わず、辞書でハンデ付きチームと対戦カードを照合する。
+    - ハンデ値はPythonで抽出済み
+    - <...>付きチームもPythonで抽出済み
+    - home/awayも現在のfixturesのhome/away列でPythonが決める
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key:
-        log("OPENAI_API_KEY未設定のため、ハンデ自動入力をスキップ")
-        return []
-
     if not blocks:
         log("ハンデ付きブロックなし")
         return []
 
-    match_lines = []
+    fixture_records = []
 
     for i, f in enumerate(fixtures):
         row_number = 10 + i
-        match_lines.append(
-            f"{row_number}: {f['start_time_jst']} | home={f['home']} | away={f['away']}"
+
+        fixture_records.append({
+            "row": row_number,
+            "time": f.get("start_time_jst", "")[-5:],
+            "home": f.get("home", ""),
+            "away": f.get("away", ""),
+            "home_canonical": f.get("home", ""),
+            "away_canonical": f.get("away", ""),
+        })
+
+    final_items = []
+
+    for block in blocks:
+        block_id = int(block["block_id"])
+        block_time = block.get("time", "")
+        teams_raw = block.get("teams", [])
+        handicap_team_raw = block.get("handicap_team", "")
+        handicap_value = str(block.get("handicap_value", "")).strip()
+
+        canonical_teams = []
+        for t in teams_raw:
+            canonical = identify_npb_team(t)
+            if canonical:
+                canonical_teams.append(canonical)
+
+        canonical_teams = list(dict.fromkeys(canonical_teams))
+        handicap_canonical = identify_npb_team(handicap_team_raw)
+
+        log(
+            f"辞書照合 block={block_id} "
+            f"teams={teams_raw}->{canonical_teams} "
+            f"handicap_team={handicap_team_raw}->{handicap_canonical} "
+            f"value={handicap_value}"
         )
 
-    block_lines = []
-    for b in blocks:
-        block_lines.append(
-            json.dumps(
-                {
-                    "block_id": b["block_id"],
-                    "time": b["time"],
-                    "teams": b["teams"],
-                    "handicap_team": b["handicap_team"],
-                    "raw_block": b["raw_block"],
-                },
-                ensure_ascii=False
-            )
-        )
+        if not handicap_canonical or not handicap_value:
+            continue
 
-    prompt = f"""
-あなたは日本語のNPBチーム名を、現在の試合一覧の home / away に照合するアシスタントです。
+        # 同じブロック内に2チーム揃っていることを基本条件にする
+        if len(canonical_teams) < 2:
+            continue
 
-重要:
-- あなたはハンデ数値を解釈してはいけません。
-- あなたはhome_0.5などの文字列を作ってはいけません。
-- あなたの仕事は、各blockの handicap_team が現在の試合一覧のどのrowの home か away かだけを返すことです。
-- 対戦相手2チームが現在の試合一覧と一致する場合だけ出力してください。
-- 片方のチームだけ一致しても出力しないでください。
-- 時刻も参考にしてよいですが、時刻だけで判断しないでください。
-- 判断が曖昧なら出力しないでください。
-- 出力はJSONのみ。
-- {{"items":[{{"block_id":1,"row":10,"side":"away"}}]}} の形式。
-- side は必ず "home" または "away"。
+        candidate_fixtures = []
 
-{NPB_TEAM_HINTS}
+        for fx in fixture_records:
+            fixture_team_set = {fx["home_canonical"], fx["away_canonical"]}
+            block_team_set = set(canonical_teams)
 
-現在の試合一覧:
-{chr(10).join(match_lines)}
+            if not block_team_set.issubset(fixture_team_set):
+                continue
 
-ハンデ付きブロック:
-{chr(10).join(block_lines)}
-"""
+            # 時刻が取れている場合は時刻一致を優先
+            time_score = 1 if block_time and fx["time"] == block_time else 0
 
-    try:
-        client = OpenAI(api_key=api_key)
+            candidate_fixtures.append((time_score, fx))
 
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Return strict JSON only. Match team names to home/away only. Do not interpret handicap values."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
+        if not candidate_fixtures:
+            continue
 
-        content = response.choices[0].message.content
-        data = json.loads(content)
-        items = data.get("items", [])
+        # 時刻一致を優先。同点なら候補が1つの場合のみ採用。
+        candidate_fixtures.sort(key=lambda x: x[0], reverse=True)
+        best_score = candidate_fixtures[0][0]
+        best = [fx for score, fx in candidate_fixtures if score == best_score]
 
-        if not isinstance(items, list):
-            return []
+        if len(best) != 1:
+            log(f"候補が曖昧なためスキップ block={block_id}: {best}")
+            continue
 
-        return items
+        fx = best[0]
 
-    except Exception as e:
-        log(f"OpenAIチーム照合失敗: {e}")
-        return []
+        if handicap_canonical == fx["home_canonical"]:
+            side = "home"
+        elif handicap_canonical == fx["away_canonical"]:
+            side = "away"
+        else:
+            continue
+
+        handicap = normalize_handicap_value(f"{side}_{handicap_value}")
+
+        if not handicap:
+            continue
+
+        final_items.append({
+            "row": fx["row"],
+            "handicap": handicap,
+            "block_id": block_id,
+            "raw_block": block.get("raw_block", ""),
+        })
+
+    log("最終ハンデ反映候補:")
+    log(json.dumps(final_items, ensure_ascii=False, indent=2))
+
+    return final_items
 
 
 def parse_handicaps_with_openai(formatted_text, fixtures):
     """
     互換用関数名。
-    実際には:
-      Python: ハンデ値・ハンデ付きチームを抽出
-      AI: rowとhome/awayだけ判定
-      Python: side + value で最終handicap生成
+    NPBではAI照合を使わず、Python辞書でrow/home/awayまで決定する。
+    AIは原文から不要行を抜き出す処理にのみ使用する。
     """
     formatted_text = normalize_extracted_lines_text(formatted_text)
 
@@ -997,55 +1115,7 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
     log("Python抽出ハンデブロック:")
     log(json.dumps(blocks, ensure_ascii=False, indent=2))
 
-    matched_items = match_handicap_blocks_with_openai(blocks, fixtures)
-
-    if not matched_items:
-        return []
-
-    block_by_id = {
-        int(b["block_id"]): b
-        for b in blocks
-    }
-
-    final_items = []
-
-    for item in matched_items:
-        try:
-            block_id = int(item.get("block_id"))
-            row = int(item.get("row"))
-            side = str(item.get("side")).strip()
-        except Exception:
-            continue
-
-        if side not in ["home", "away"]:
-            continue
-
-        block = block_by_id.get(block_id)
-        if not block:
-            continue
-
-        value = str(block.get("handicap_value", "")).strip()
-
-        if not value:
-            continue
-
-        handicap = f"{side}_{value}"
-        handicap = normalize_handicap_value(handicap)
-
-        if not handicap:
-            continue
-
-        final_items.append({
-            "row": row,
-            "handicap": handicap,
-            "block_id": block_id,
-            "raw_block": block.get("raw_block", ""),
-        })
-
-    log("最終ハンデ反映候補:")
-    log(json.dumps(final_items, ensure_ascii=False, indent=2))
-
-    return final_items
+    return match_handicap_blocks_with_python(blocks, fixtures)
 
 
 def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
