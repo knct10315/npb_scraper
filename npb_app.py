@@ -8,6 +8,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
+CODE_VERSION = "npb_ai_extract_only_v4_20260517"
+
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
 
@@ -22,7 +24,6 @@ LEAGUE_NAME = "NPB"
 
 CHUNK_SIZE = 3
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-CODE_VERSION = "npb_ai_format_v3_20260517"
 
 HANDICAP_LINES = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
 
@@ -36,7 +37,6 @@ BLOCK_RESOURCE_TYPES = {"image", "font", "media", "stylesheet"}
 KNOWN_BOOKMAKER_KEYWORDS = [
     "bet", "bet365", "betinasia", "pinnacle", "1xbet", "888sport",
     "unibet", "williamhill", "stake", "bwin", "betfair", "betmgm",
-    "draftkings", "fanduel", "caesars", "pointsbet", "betrivers",
     "duelbits", "roobet", "n1bet", "megapari", "mozzartbet",
 ]
 
@@ -56,6 +56,39 @@ ALLOWED_HANDICAP_VALUES = {
     "away_1半", "away_1半1", "away_1半2", "away_1半3", "away_1半4", "away_1半5", "away_1半6", "away_1半7", "away_1半8", "away_1半9",
     "away_2半", "away_2半1", "away_2半2", "away_2半3", "away_2半4", "away_2半5", "away_2半6", "away_2半7", "away_2半8", "away_2半9",
 }
+
+NPB_TEAM_HINTS = """
+NPBチーム名対応ヒント:
+巨人 = Yomiuri Giants
+読売 = Yomiuri Giants
+ジャイアンツ = Yomiuri Giants
+横浜 = Yokohama BayStars
+DeNA = Yokohama BayStars
+ＤｅＮＡ = Yokohama BayStars
+ベイスターズ = Yokohama BayStars
+阪神 = Hanshin Tigers
+タイガース = Hanshin Tigers
+広島 = Hiroshima Carp
+カープ = Hiroshima Carp
+中日 = Chunichi Dragons
+ドラゴンズ = Chunichi Dragons
+ヤクルト = Yakult Swallows
+スワローズ = Yakult Swallows
+日本ハム = Nippon Ham Fighters
+日ハム = Nippon Ham Fighters
+ハム = Nippon Ham Fighters
+西武 = Seibu Lions
+ライオンズ = Seibu Lions
+楽天 = Rakuten Gold. Eagles
+イーグルス = Rakuten Gold. Eagles
+ソフト = Fukuoka S. Hawks
+ソフトバンク = Fukuoka S. Hawks
+ホークス = Fukuoka S. Hawks
+ロッテ = Chiba Lotte Marines
+マリーンズ = Chiba Lotte Marines
+オリックス = Orix Buffaloes
+バファローズ = Orix Buffaloes
+"""
 
 
 def log(msg):
@@ -212,7 +245,6 @@ def get_fixture_rows(page):
         if start_time is None or not is_within_target_hours(start_time):
             continue
 
-        # オッズ未掲載試合は対象外
         decimal_numbers = re.findall(r"\d+\.\d+", text)
         if len(decimal_numbers) < 2:
             continue
@@ -549,48 +581,67 @@ def read_handicap_raw_text(spreadsheet):
     return "\n".join(lines).strip()
 
 
-def format_handicap_text_with_openai(raw_text):
+def normalize_extracted_lines_text(text):
+    lines = []
+    for line in str(text).splitlines():
+        line = line.strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def extract_relevant_handicap_lines_with_openai(raw_text):
     """
-    胴元メッセージ全体をAIに渡し、必要な試合情報だけを3行ブロック形式へ整形する。
-    キーワード削除ではなく「必要情報の抽出」を行う。
+    胴元原文から必要行だけを抜き出す。
+    重要: チーム名行や <...> 付き行は絶対に書き換えず、原文の行をそのまま残す。
     """
     api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
-        log("OPENAI_API_KEY未設定のため、ハンデ整形をスキップ")
+        log("OPENAI_API_KEY未設定のため、ハンデ入力整形をスキップ")
         return raw_text
-
-    log("OpenAIでハンデ入力シートを整形します")
 
     if not raw_text:
         return ""
 
     prompt = f"""
-以下は胴元から届いたハンデ情報です。
-この文章から「実際の試合カード」と「<...> のハンデ表記」だけを抽出してください。
-特定キーワード削除ではなく、意味としてチーム名・時刻・ハンデに関係する行だけを残してください。
+あなたは胴元メッセージから、野球の試合カード情報だけを抜き出す抽出器です。
 
 目的:
-後続処理で「2チームとハンデ」を現在の試合一覧に照合します。
-そのため、チーム名・時刻・<...> のハンデ表記だけが残る形が望ましいです。
+不要な説明行・見出し行を除外し、試合カードを表す行だけを残してください。
 
-整形ルール:
-- 出力はJSONのみ。
-- {{"cleaned_text": "..."}} の形式で返してください。
-- 試合は原則として、次の3行ブロックに整形してください。
-  チームA
-  時刻
-  チームB<ハンデ>
-- ハンデがチームA側に付いている場合は、チームA<ハンデ> のまま残してください。
-- <05>, <03>, <1.2>, <0半>, <1半3> などの表記は絶対に変更しないでください。
-- チーム名は原文のままで構いません。英訳しないでください。
-- 不要な説明文・見出し・締切文・注意書き・メニュー文は削除してください。
-- チーム名に見える行、時刻行、<...> を含む行だけを残してください。
-- 原則として1試合を「チームA」「時刻」「チームB」の3行にしてください。
-- ただし、原文に存在しない試合やハンデは絶対に追加しないでください。
-- 迷う場合は消しすぎず、チーム名らしき行は残してください。
+絶対ルール:
+- 原文に存在する行だけを出力してください。
+- チーム名が書かれた行を一文字も変更してはいけません。
+- <...> が付いている行を一文字も変更してはいけません。
+- <...> を別の行・別のチームへ移動してはいけません。
+- <...> の中身を変更してはいけません。
+- チーム名を英語に変換してはいけません。
+- チーム名を正式名称に補完してはいけません。
+- 行の順番を変えてはいけません。
+- 不要行を削除するだけにしてください。
+- 判断に迷う行は残してください。
 
-胴元メッセージ:
+残すべき行:
+- チーム名と思われる行
+- <05> や <1.2> や <1半3> のようなハンデ付きチーム行
+- 13:00 のような試合時刻行
+
+消してよい行:
+- 延長なし
+- 試合開始◯分前締切
+- 締切説明
+- 見出し
+- 空行
+- URL
+- メニュー表示
+
+出力形式:
+- JSONのみ
+- {{"lines": ["原文の行1", "原文の行2"]}} の形式
+- linesの各要素は原文の1行をそのまま入れてください。
+
+胴元原文:
 {raw_text}
 """
 
@@ -602,7 +653,7 @@ def format_handicap_text_with_openai(raw_text):
             messages=[
                 {
                     "role": "system",
-                    "content": "Return strict JSON only. Extract relevant game lines; do not invent information."
+                    "content": "Return strict JSON only. Extract lines only. Do not rewrite any line."
                 },
                 {
                     "role": "user",
@@ -615,43 +666,33 @@ def format_handicap_text_with_openai(raw_text):
 
         content = response.choices[0].message.content
         data = json.loads(content)
-        cleaned = str(data.get("cleaned_text", "")).strip()
+        lines = data.get("lines", [])
 
-        if not cleaned:
-            log("AI整形結果が空のため、原文を使用")
+        if not isinstance(lines, list):
             return raw_text
 
-        log("ハンデ入力テキストAI整形後:")
-        log(cleaned)
-        return cleaned
+        extracted = "\n".join(str(line).strip() for line in lines if str(line).strip())
+        return normalize_extracted_lines_text(extracted) or raw_text
 
     except Exception as e:
-        log(f"OpenAIハンデ整形失敗: {e}")
+        log(f"OpenAIハンデ入力整形失敗: {e}")
         return raw_text
 
 
-def write_cleaned_handicap_text(spreadsheet, cleaned_text):
-    """
-    入力シートを、AIで整形したテキストへ実際に書き戻す。
-    後から目視確認しやすいよう、A列に1行ずつ展開する。
-    """
-    if not cleaned_text:
-        return
-
+def write_formatted_handicap_input(spreadsheet, formatted_text):
     try:
         ws = get_worksheet_by_gid(spreadsheet, HANDICAP_INPUT_GID)
         ws.batch_clear(["A1:Z100"])
 
-        lines = cleaned_text.splitlines()
-        values = [[line] for line in lines]
+        lines = normalize_extracted_lines_text(formatted_text).splitlines()
+        values = [[line] for line in lines if line.strip()]
 
         if values:
             ws.update("A1", values)
 
-        log("ハンデ入力シートをAI整形済みテキストへ更新")
-
+        log("ハンデ入力シートを抽出済みテキストへ更新")
     except Exception as e:
-        log(f"ハンデ入力シート書き戻し失敗: {e}")
+        log(f"ハンデ入力シート更新失敗: {e}")
 
 
 def normalize_handicap_value(value):
@@ -680,18 +721,21 @@ def normalize_handicap_value(value):
     return text
 
 
-def parse_handicaps_with_openai(raw_text, fixtures):
+def parse_handicaps_with_openai(formatted_text, fixtures):
     api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
         log("OPENAI_API_KEY未設定のため、ハンデ自動入力をスキップ")
         return []
 
-    cleaned_text = raw_text.strip()
+    formatted_text = normalize_extracted_lines_text(formatted_text)
 
-    if not cleaned_text:
-        log("ハンデ入力テキストが空")
+    if not formatted_text:
+        log("ハンデ入力テキストなし")
         return []
+
+    log("ハンデ入力テキスト解析対象:")
+    log(formatted_text)
 
     match_lines = []
 
@@ -717,22 +761,17 @@ def parse_handicaps_with_openai(raw_text, fixtures):
 - handicap は必ず「許可されるhandicap値」から完全一致で1つ選んでください。
 - 許可リストにない値は絶対に出力しないでください。
 - <> が付いているチームがハンデを受けている側です。
+- <...> が付いている行のチームを絶対に逆にしてはいけません。
 - homeチームに <> が付いていれば home側の値。
 - awayチームに <> が付いていれば away側の値。
 - <05> は 0.5、<04> は 0.4、<03> は 0.3、<1.2> は 1.2 と解釈。
 - <0半> は 0半、<1半3> は 1半3 のように、半を含む表記は小数に変換せず、許可リストの形式で出力してください。
-- チーム名は日本語・カタカナ・略称でもよいが、必ず現在の試合一覧と照合してください。
-- 対戦相手が違う場合は出力しないでください。
+- 時刻行だけで試合を判断しないでください。
+- 片方のチーム名だけ一致しても、対戦相手が一致しなければ出力しないでください。
+- 対戦する2チームが現在の試合一覧の home/away と一致する場合だけ出力してください。
 - 該当不明なら出力しないでください。
 
-追加ルール:
-- 整形済みメッセージは、基本的に「チーム行」「時刻行」「チーム行」の3行セットです。
-- <...> が付いていないチームにはハンデを付けないでください。
-- 時刻行だけで試合を判断しないでください。
-- 直前・直後にある無関係な行をチーム名として扱わないでください。
-- 対戦する2チームが現在の試合一覧の home/away と一致する場合だけ出力してください。
-- 片方のチーム名だけ一致しても、対戦相手が一致しなければ出力しないでください。
-
+{NPB_TEAM_HINTS}
 
 現在の試合一覧:
 {chr(10).join(match_lines)}
@@ -740,8 +779,8 @@ def parse_handicaps_with_openai(raw_text, fixtures):
 許可されるhandicap値:
 {allowed_values_text}
 
-整形済み胴元メッセージ:
-{cleaned_text}
+抽出済み胴元メッセージ:
+{formatted_text}
 """
 
     try:
@@ -784,14 +823,13 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
         log("ハンデ入力テキストなし")
         return
 
-    cleaned_text = format_handicap_text_with_openai(raw_text)
+    formatted_text = extract_relevant_handicap_lines_with_openai(raw_text)
+    formatted_text = normalize_extracted_lines_text(formatted_text)
 
-    # AI整形結果を必ず入力シートへ書き戻す。
-    # これにより、実際にこのコードが動いたか、AIがどう整形したかを目視確認できる。
-    if cleaned_text and cleaned_text.strip():
-        write_cleaned_handicap_text(spreadsheet, cleaned_text)
+    if formatted_text:
+        write_formatted_handicap_input(spreadsheet, formatted_text)
 
-    items = parse_handicaps_with_openai(cleaned_text, fixtures)
+    items = parse_handicaps_with_openai(formatted_text, fixtures)
 
     if not items:
         log("反映対象ハンデなし")
@@ -905,6 +943,7 @@ def process_fixture(page, f):
 
 def run_job():
     log(f"CODE_VERSION: {CODE_VERSION}")
+
     results = []
     total_start = time.time()
 
