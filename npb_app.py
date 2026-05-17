@@ -817,7 +817,6 @@ def write_formatted_handicap_input(spreadsheet, formatted_text):
 
 
 def normalize_handicap_value(value):
-def normalize_handicap_value(value):
     if value is None:
         return ""
 
