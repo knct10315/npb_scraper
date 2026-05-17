@@ -1,4 +1,6 @@
-from playwright.sync_api import sync_playwright, TimeoutError
+from pathlib import Path
+
+code = r'''from playwright.sync_api import sync_playwright, TimeoutError
 from datetime import datetime, timedelta
 import re
 import os
@@ -211,7 +213,6 @@ def get_fixture_rows(page):
         if start_time is None or not is_within_target_hours(start_time):
             continue
 
-        # オッズ未掲載試合は対象外
         decimal_numbers = re.findall(r"\d+\.\d+", text)
         if len(decimal_numbers) < 2:
             continue
@@ -548,60 +549,26 @@ def read_handicap_raw_text(spreadsheet):
     return "\n".join(lines).strip()
 
 
-def clean_handicap_text(raw_text):
+def write_cleaned_text_to_input_sheet(spreadsheet, cleaned_text):
     """
-    胴元メッセージから、AIが誤解しやすい見出し・締切文などを除去する。
-    チーム名、時刻、<05> などのハンデ表記を含む行を優先して残す。
+    AIが抽出・整形した胴元メッセージを、入力シート上にも書き戻す。
+    これにより、AIが何を見て判断したかを人間が確認できる。
     """
-    if not raw_text:
-        return ""
+    try:
+        ws = get_worksheet_by_gid(spreadsheet, HANDICAP_INPUT_GID)
 
-    remove_keywords = [
-        "延長なし",
-        "延長無し",
-        "試合開始",
-        "締切",
-        "締め切り",
-        "〆切",
-        "受付",
-        "Menu",
-        "メニュー",
-        "対象",
-        "野球",
-        "プロ野球",
-        "本日",
-        "明日",
-        "以下",
-        "ハンデ",
-    ]
+        ws.batch_clear(["A1:Z100"])
 
-    cleaned_lines = []
+        lines = [line for line in cleaned_text.splitlines() if line.strip()]
+        values = [[line] for line in lines]
 
-    for line in raw_text.splitlines():
-        line = str(line).strip()
+        if values:
+            ws.update("A1", values)
 
-        if not line:
-            continue
+        log(f"入力シートを整形済みテキストに更新: {len(values)}行")
 
-        if line.startswith("http"):
-            continue
-
-        # 「MLB」「NPB」はリーグ見出しとして消す。ただしチーム名付きやハンデ付きなら残す。
-        if line in ["MLB", "ＮＰＢ", "NPB", "ＭＬＢ"]:
-            continue
-
-        # 明らかな説明・見出し行を除外。ただし <...> がある行は残す。
-        if any(k in line for k in remove_keywords):
-            if "<" not in line or ">" not in line:
-                continue
-
-        # 記号だけの行を除外
-        if re.fullmatch(r"[-_=ー－・●○◆◇■□★☆\s]+", line):
-            continue
-
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines).strip()
+    except Exception as e:
+        log(f"入力シート書き戻し失敗: {e}")
 
 
 def normalize_handicap_value(value):
@@ -630,24 +597,97 @@ def normalize_handicap_value(value):
     return text
 
 
-def parse_handicaps_with_openai(raw_text, fixtures):
+def extract_relevant_handicap_text_with_openai(raw_text):
+    """
+    胴元メッセージ全体から、チーム・時刻・ハンデに関係する行だけをAIで抽出・整形する。
+    特定キーワード削除ではなく、必要情報だけを残す方式。
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    if not api_key:
+        log("OPENAI_API_KEY未設定のため、ハンデ整形をスキップ")
+        return raw_text
+
+    if not raw_text:
+        return ""
+
+    prompt = f"""
+以下は胴元から届いた野球ハンデ情報です。
+不要な説明文・見出し・注意書き・締切文などを除き、試合情報として必要な行だけを残して整形してください。
+
+目的:
+後続処理で、現在のNPB試合一覧と照合し、E列へ home_0.5 / away_0.5 などを入力します。
+
+残すべき情報:
+- チーム名の行
+- 時刻の行
+- <05>、<03>、<1.2>、<0半>、<1半3> などハンデ表記を含むチーム行
+- 1試合は基本的に「チーム行」「時刻行」「チーム行」の3行にしてください
+- 余計な説明・見出し・締切・注意書きは残さないでください
+
+重要:
+- 事実を補完しないでください。
+- チーム名やハンデを推測で作らないでください。
+- 入力に存在しない試合を追加しないでください。
+- ハンデ表記 <...> は変更せず残してください。
+- 時刻は入力にある場合だけ残してください。
+- 出力はJSONのみ。
+- "cleaned_text" に、改行区切りの整形済みテキストを入れてください。
+- 試合と試合の間は空行を1行入れてください。
+
+胴元メッセージ:
+{raw_text}
+"""
+
+    try:
+        client = OpenAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Return strict JSON only. Do not add facts not present in the input."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+
+        content = response.choices[0].message.content
+        data = json.loads(content)
+        cleaned_text = str(data.get("cleaned_text", "")).strip()
+
+        if not cleaned_text:
+            log("AI整形結果が空のため、元テキストを使用")
+            return raw_text
+
+        log("AI整形済みハンデテキスト:")
+        log(cleaned_text)
+
+        return cleaned_text
+
+    except Exception as e:
+        log(f"OpenAIハンデ整形失敗: {e}")
+        return raw_text
+
+
+def parse_handicaps_with_openai(cleaned_text, fixtures):
     api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
         log("OPENAI_API_KEY未設定のため、ハンデ自動入力をスキップ")
         return []
 
-    cleaned_text = clean_handicap_text(raw_text)
-
     if not cleaned_text:
-        log("ハンデ入力テキストは前処理後に空")
+        log("整形済みハンデテキストなし")
         return []
 
-    log("ハンデ入力テキスト前処理後:")
-    log(cleaned_text)
-
     match_lines = []
-
     for i, f in enumerate(fixtures):
         row_number = 10 + i
         match_lines.append(
@@ -679,13 +719,11 @@ def parse_handicaps_with_openai(raw_text, fixtures):
 - 該当不明なら出力しないでください。
 
 追加ルール:
-- 前処理済みメッセージは、基本的に「チーム行」「時刻行」「チーム行」の3行セットです。
+- 整形済みメッセージは、基本的に「チーム行」「時刻行」「チーム行」の3行セットです。
 - <...> が付いていないチームにはハンデを付けないでください。
 - 時刻行だけで試合を判断しないでください。
-- 直前・直後にある無関係な行をチーム名として扱わないでください。
 - 対戦する2チームが現在の試合一覧の home/away と一致する場合だけ出力してください。
 - 片方のチーム名だけ一致しても、対戦相手が一致しなければ出力しないでください。
-
 
 現在の試合一覧:
 {chr(10).join(match_lines)}
@@ -693,7 +731,7 @@ def parse_handicaps_with_openai(raw_text, fixtures):
 許可されるhandicap値:
 {allowed_values_text}
 
-前処理済み胴元メッセージ:
+整形済み胴元メッセージ:
 {cleaned_text}
 """
 
@@ -737,7 +775,10 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
         log("ハンデ入力テキストなし")
         return
 
-    items = parse_handicaps_with_openai(raw_text, fixtures)
+    cleaned_text = extract_relevant_handicap_text_with_openai(raw_text)
+    write_cleaned_text_to_input_sheet(spreadsheet, cleaned_text)
+
+    items = parse_handicaps_with_openai(cleaned_text, fixtures)
 
     if not items:
         log("反映対象ハンデなし")
@@ -879,3 +920,7 @@ def run_job():
     write_to_sheet(results)
     log(f"完了: {len(results)} 件 / {time.time() - total_start:.1f}s")
     return results
+'''
+
+Path("/mnt/data/npb_app_ai_clean.py").write_text(code, encoding="utf-8")
+print("/mnt/data/npb_app_ai_clean.py")
