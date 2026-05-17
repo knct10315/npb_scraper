@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_match_blocks_v5_20260517"
+CODE_VERSION = "npb_python_decides_handicap_v6_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -594,10 +594,73 @@ def is_time_line(line):
     return bool(re.fullmatch(r"\d{1,2}:\d{2}", str(line).strip()))
 
 
+def parse_handicap_token_from_line(line):
+    """
+    チーム行から <07>, <1.2>, <1半3> などを抽出する。
+    戻り値:
+      (team_text_without_token, token_text, handicap_value_text)
+    handicap_value_text は許可リストにある値のうち side を除いた部分。
+    """
+    line = str(line).strip()
+    m = re.search(r"<([^<>]+)>", line)
+
+    if not m:
+        return line, None, None
+
+    token = m.group(1).strip()
+    team_text = (line[:m.start()] + line[m.end():]).strip()
+
+    # 全角数字などを軽く補正
+    token_norm = (
+        token.replace("０", "0")
+        .replace("１", "1")
+        .replace("２", "2")
+        .replace("３", "3")
+        .replace("４", "4")
+        .replace("５", "5")
+        .replace("６", "6")
+        .replace("７", "7")
+        .replace("８", "8")
+        .replace("９", "9")
+        .replace("．", ".")
+        .replace(" ", "")
+        .replace("　", "")
+    )
+
+    # 半を含む表記はそのまま残す。例: 1半3
+    if "半" in token_norm:
+        value = token_norm
+        return team_text, token, value
+
+    # 05, 04, 03 などは 0.5, 0.4, 0.3
+    if re.fullmatch(r"\d{2}", token_norm):
+        value = f"0.{int(token_norm)}"
+        # 05 -> 0.5, 07 -> 0.7
+        value = str(float(value)).rstrip("0").rstrip(".")
+        return team_text, token, value
+
+    # 5 のような1桁だけ来た場合は 0.5 と解釈
+    if re.fullmatch(r"\d", token_norm):
+        value = f"0.{token_norm}"
+        value = str(float(value)).rstrip("0").rstrip(".")
+        return team_text, token, value
+
+    # 1.2 など
+    if re.fullmatch(r"\d+(?:\.\d+)?", token_norm):
+        num = float(token_norm)
+        if num.is_integer():
+            value = str(int(num))
+        else:
+            value = str(num).rstrip("0").rstrip(".")
+        return team_text, token, value
+
+    return team_text, token, None
+
+
 def build_match_blocks(text):
     """
-    抽出済みテキストを、原則「チーム行 / 時刻行 / チーム行」の試合ブロックへ分割する。
-    行の内容自体は変更しない。ブロック化できない残り行は最後にまとめて残す。
+    抽出済みテキストを「チーム行 / 時刻行 / チーム行」の試合ブロックへ分割する。
+    行の内容自体は変更しない。
     """
     lines = [
         str(line).strip()
@@ -614,7 +677,7 @@ def build_match_blocks(text):
         has_time = any(is_time_line(x) for x in current)
 
         # 基本形: チーム / 時刻 / チーム
-        # 時刻行の後に1行以上来たら、1試合として区切る
+        # 時刻行の後に1行以上来たら1試合として区切る。
         if has_time and len(current) >= 3 and not is_time_line(current[-1]):
             blocks.append(current)
             current = []
@@ -626,10 +689,6 @@ def build_match_blocks(text):
 
 
 def format_blocks_for_sheet(text):
-    """
-    入力シートへ戻す表示用。
-    試合ブロックごとに1行空欄を入れ、目視確認しやすくする。
-    """
     blocks = build_match_blocks(text)
 
     values = []
@@ -644,10 +703,6 @@ def format_blocks_for_sheet(text):
 
 
 def format_blocks_for_ai(text):
-    """
-    AI解析用。
-    MATCH番号を付けて、試合ごとの境界を明確にする。
-    """
     blocks = build_match_blocks(text)
 
     parts = []
@@ -762,6 +817,7 @@ def write_formatted_handicap_input(spreadsheet, formatted_text):
 
 
 def normalize_handicap_value(value):
+def normalize_handicap_value(value):
     if value is None:
         return ""
 
@@ -787,72 +843,107 @@ def normalize_handicap_value(value):
     return text
 
 
-def parse_handicaps_with_openai(formatted_text, fixtures):
+def extract_handicap_blocks(formatted_text):
+    """
+    ブロックからハンデ付きチームとハンデ値をPythonで抽出する。
+    数字・<...> の位置はAIに判断させない。
+    """
+    blocks = build_match_blocks(formatted_text)
+    extracted = []
+
+    for block_index, block in enumerate(blocks, start=1):
+        time_text = ""
+        teams = []
+        handicap_team = ""
+        handicap_value = ""
+
+        for line in block:
+            if is_time_line(line):
+                time_text = line
+                continue
+
+            team_text, token, value = parse_handicap_token_from_line(line)
+            teams.append(team_text)
+
+            if token is not None:
+                handicap_team = team_text
+                handicap_value = value or ""
+
+        if not handicap_team or not handicap_value:
+            continue
+
+        extracted.append({
+            "block_id": block_index,
+            "time": time_text,
+            "teams": teams,
+            "handicap_team": handicap_team,
+            "handicap_value": handicap_value,
+            "raw_block": "\n".join(block),
+        })
+
+    return extracted
+
+
+def match_handicap_blocks_with_openai(blocks, fixtures):
+    """
+    AIには、ハンデ付きチームが現在の試合一覧のどのrowのhome/awayかだけを判定させる。
+    ハンデ数値はPythonで抽出済みのものを使う。
+    """
     api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
         log("OPENAI_API_KEY未設定のため、ハンデ自動入力をスキップ")
         return []
 
-    formatted_text = normalize_extracted_lines_text(formatted_text)
-
-    if not formatted_text:
-        log("ハンデ入力テキストなし")
+    if not blocks:
+        log("ハンデ付きブロックなし")
         return []
-
-    ai_block_text = format_blocks_for_ai(formatted_text)
-
-    log("ハンデ入力テキスト解析対象:")
-    log(ai_block_text)
 
     match_lines = []
 
     for i, f in enumerate(fixtures):
         row_number = 10 + i
         match_lines.append(
-            f"{row_number}: {f['start_time_jst']} | {f['home']} vs {f['away']}"
+            f"{row_number}: {f['start_time_jst']} | home={f['home']} | away={f['away']}"
         )
 
-    allowed_values_text = "\n".join(sorted(ALLOWED_HANDICAP_VALUES))
+    block_lines = []
+    for b in blocks:
+        block_lines.append(
+            json.dumps(
+                {
+                    "block_id": b["block_id"],
+                    "time": b["time"],
+                    "teams": b["teams"],
+                    "handicap_team": b["handicap_team"],
+                    "raw_block": b["raw_block"],
+                },
+                ensure_ascii=False
+            )
+        )
 
     prompt = f"""
-あなたは日本語の胴元ハンデ情報を、Google Sheets入力用のJSONに変換するアシスタントです。
-
-対象リーグは NPB のみです。
-以下の「現在の試合一覧」に存在する試合だけを対象にしてください。
-他リーグの情報、前日情報、対戦相手が一致しない情報、判断が曖昧な情報は出力しないでください。
+あなたは日本語のNPBチーム名を、現在の試合一覧の home / away に照合するアシスタントです。
 
 重要:
+- あなたはハンデ数値を解釈してはいけません。
+- あなたはhome_0.5などの文字列を作ってはいけません。
+- あなたの仕事は、各blockの handicap_team が現在の試合一覧のどのrowの home か away かだけを返すことです。
+- 対戦相手2チームが現在の試合一覧と一致する場合だけ出力してください。
+- 片方のチームだけ一致しても出力しないでください。
+- 時刻も参考にしてよいですが、時刻だけで判断しないでください。
+- 判断が曖昧なら出力しないでください。
 - 出力はJSONのみ。
-- "items" という配列だけを返してください。
-- 各要素は {{"row": 行番号, "handicap": "home_0.5"}} の形式。
-- handicap は必ず「許可されるhandicap値」から完全一致で1つ選んでください。
-- 許可リストにない値は絶対に出力しないでください。
-- <> が付いているチームがハンデを受けている側です。
-- <...> が付いている行のチームを絶対に逆にしてはいけません。
-- home/awayは、胴元メッセージ内の上下順ではなく、必ず「現在の試合一覧」の home / away 列で判定してください。
-- 現在の試合一覧では "A vs B" の左側Aがhome、右側Bがawayです。
-- 胴元メッセージの同じMATCHブロック内で、現在の試合一覧のhomeチームに <> が付いていれば home側の値。
-- 胴元メッセージの同じMATCHブロック内で、現在の試合一覧のawayチームに <> が付いていれば away側の値。
-- 胴元メッセージの上に書かれているチームがhomeとは限りません。
-- 胴元メッセージの下に書かれているチームがawayとは限りません。
-- <05> は 0.5、<04> は 0.4、<03> は 0.3、<1.2> は 1.2 と解釈。
-- <0半> は 0半、<1半3> は 1半3 のように、半を含む表記は小数に変換せず、許可リストの形式で出力してください。
-- 時刻行だけで試合を判断しないでください。
-- 片方のチーム名だけ一致しても、対戦相手が一致しなければ出力しないでください。
-- 対戦する2チームが現在の試合一覧の home/away と一致する場合だけ出力してください。
-- 該当不明なら出力しないでください。
+- {{"items":[{{"block_id":1,"row":10,"side":"away"}}]}} の形式。
+- side は必ず "home" または "away"。
 
 {NPB_TEAM_HINTS}
 
 現在の試合一覧:
 {chr(10).join(match_lines)}
 
-許可されるhandicap値:
-{allowed_values_text}
-
-MATCH番号付き抽出済み胴元メッセージ:
-{ai_block_text}
+ハンデ付きブロック:
+{chr(10).join(block_lines)}
 """
 
     try:
@@ -863,7 +954,7 @@ MATCH番号付き抽出済み胴元メッセージ:
             messages=[
                 {
                     "role": "system",
-                    "content": "Return strict JSON only. Do not guess when uncertain."
+                    "content": "Return strict JSON only. Match team names to home/away only. Do not interpret handicap values."
                 },
                 {
                     "role": "user",
@@ -876,16 +967,86 @@ MATCH番号付き抽出済み胴元メッセージ:
 
         content = response.choices[0].message.content
         data = json.loads(content)
-
         items = data.get("items", [])
+
         if not isinstance(items, list):
             return []
 
         return items
 
     except Exception as e:
-        log(f"OpenAIハンデ解析失敗: {e}")
+        log(f"OpenAIチーム照合失敗: {e}")
         return []
+
+
+def parse_handicaps_with_openai(formatted_text, fixtures):
+    """
+    互換用関数名。
+    実際には:
+      Python: ハンデ値・ハンデ付きチームを抽出
+      AI: rowとhome/awayだけ判定
+      Python: side + value で最終handicap生成
+    """
+    formatted_text = normalize_extracted_lines_text(formatted_text)
+
+    if not formatted_text:
+        log("ハンデ入力テキストなし")
+        return []
+
+    blocks = extract_handicap_blocks(formatted_text)
+
+    log("Python抽出ハンデブロック:")
+    log(json.dumps(blocks, ensure_ascii=False, indent=2))
+
+    matched_items = match_handicap_blocks_with_openai(blocks, fixtures)
+
+    if not matched_items:
+        return []
+
+    block_by_id = {
+        int(b["block_id"]): b
+        for b in blocks
+    }
+
+    final_items = []
+
+    for item in matched_items:
+        try:
+            block_id = int(item.get("block_id"))
+            row = int(item.get("row"))
+            side = str(item.get("side")).strip()
+        except Exception:
+            continue
+
+        if side not in ["home", "away"]:
+            continue
+
+        block = block_by_id.get(block_id)
+        if not block:
+            continue
+
+        value = str(block.get("handicap_value", "")).strip()
+
+        if not value:
+            continue
+
+        handicap = f"{side}_{value}"
+        handicap = normalize_handicap_value(handicap)
+
+        if not handicap:
+            continue
+
+        final_items.append({
+            "row": row,
+            "handicap": handicap,
+            "block_id": block_id,
+            "raw_block": block.get("raw_block", ""),
+        })
+
+    log("最終ハンデ反映候補:")
+    log(json.dumps(final_items, ensure_ascii=False, indent=2))
+
+    return final_items
 
 
 def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
