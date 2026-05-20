@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_pair_blocks_v4_20260517"
+CODE_VERSION = "mlb_dictionary_match_v6_20260518"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -57,6 +57,176 @@ ALLOWED_HANDICAP_VALUES = {
     "away_1半", "away_1半1", "away_1半2", "away_1半3", "away_1半4", "away_1半5", "away_1半6", "away_1半7", "away_1半8", "away_1半9",
     "away_2半", "away_2半1", "away_2半2", "away_2半3", "away_2半4", "away_2半5", "away_2半6", "away_2半7", "away_2半8", "away_2半9",
 }
+
+MLB_TEAM_ALIASES = {
+    "Philadelphia Phillies": [
+        "フィリーズ", "フィラデルフィア", "フィラデルフィアフィリーズ",
+        "Phillies", "Philadelphia", "Philadelphia Phillies", "PHI",
+    ],
+    "Cincinnati Reds": [
+        "レッズ", "シンシナティ", "シンシナティレッズ",
+        "Reds", "Cincinnati", "Cincinnati Reds", "CIN",
+    ],
+    "Tampa Bay Rays": [
+        "レイズ", "タンパベイ", "タンパ", "タンパベイレイズ",
+        "Rays", "Tampa Bay", "Tampa Bay Rays", "TB", "TBR",
+    ],
+    "Baltimore Orioles": [
+        "オリオールズ", "ボルチモア", "ボルティモア", "ボルチモアオリオールズ",
+        "Orioles", "Baltimore", "Baltimore Orioles", "BAL",
+    ],
+    "Minnesota Twins": [
+        "ツインズ", "ミネソタ", "ミネソタツインズ",
+        "Twins", "Minnesota", "Minnesota Twins", "MIN",
+    ],
+    "Houston Astros": [
+        "アストロズ", "ヒューストン", "ヒューストンアストロズ",
+        "Astros", "Houston", "Houston Astros", "HOU",
+    ],
+    "Colorado Rockies": [
+        "ロッキーズ", "コロラド", "コロラドロッキーズ",
+        "Rockies", "Colorado", "Colorado Rockies", "COL",
+    ],
+    "Texas Rangers": [
+        "レンジャーズ", "テキサス", "テキサスレンジャーズ",
+        "Rangers", "Texas", "Texas Rangers", "TEX",
+    ],
+    "Arizona Diamondbacks": [
+        "ダイヤモンドバックス", "ダイヤモンドバック", "Dバックス", "Ｄバックス",
+        "アリゾナ", "アリゾナダイヤモンドバックス",
+        "Diamondbacks", "Dbacks", "D-backs", "Arizona", "Arizona Diamondbacks", "ARI",
+    ],
+    "San Francisco Giants": [
+        "ジャイアンツ", "サンフランシスコ", "サンフランシスコジャイアンツ",
+        "Giants", "San Francisco", "San Francisco Giants", "SF", "SFG",
+    ],
+    "Seattle Mariners": [
+        "マリナーズ", "シアトル", "シアトルマリナーズ",
+        "Mariners", "Seattle", "Seattle Mariners", "SEA",
+    ],
+    "Chicago White Sox": [
+        "ホワイトソックス", "Wソックス", "Ｗソックス", "シカゴホワイトソックス",
+        "White Sox", "Whitesox", "Chicago White Sox", "CWS", "CHW",
+    ],
+    "Detroit Tigers": [
+        "タイガース", "デトロイト", "デトロイトタイガース",
+        "Tigers", "Detroit", "Detroit Tigers", "DET",
+    ],
+    "Cleveland Guardians": [
+        "ガーディアンズ", "クリーブランド", "クリーブランドガーディアンズ",
+        "Guardians", "Cleveland", "Cleveland Guardians", "CLE",
+    ],
+    "Miami Marlins": [
+        "マーリンズ", "マイアミ", "マイアミマーリンズ",
+        "Marlins", "Miami", "Miami Marlins", "MIA",
+    ],
+    "Atlanta Braves": [
+        "ブレーブス", "アトランタ", "アトランタブレーブス",
+        "Braves", "Atlanta", "Atlanta Braves", "ATL",
+    ],
+    "Washington Nationals": [
+        "ナショナルズ", "ワシントン", "ワシントンナショナルズ",
+        "Nationals", "Washington", "Washington Nationals", "WSH", "WAS",
+    ],
+    "New York Mets": [
+        "メッツ", "ニューヨークメッツ", "NYメッツ", "ＮＹメッツ",
+        "Mets", "New York Mets", "NYM",
+    ],
+    "New York Yankees": [
+        "ヤンキース", "ニューヨークヤンキース", "NYヤンキース", "ＮＹヤンキース",
+        "Yankees", "New York Yankees", "NYY",
+    ],
+    "Toronto Blue Jays": [
+        "ブルージェイズ", "ブルージェイ", "トロント", "トロントブルージェイズ",
+        "Blue Jays", "Bluejays", "Toronto", "Toronto Blue Jays", "TOR",
+    ],
+    "Chicago Cubs": [
+        "カブス", "シカゴカブス",
+        "Cubs", "Chicago Cubs", "CHC",
+    ],
+    "Milwaukee Brewers": [
+        "ブリュワーズ", "ブルワーズ", "ミルウォーキー", "ミルウォーキーブリュワーズ",
+        "Brewers", "Milwaukee", "Milwaukee Brewers", "MIL",
+    ],
+    "Kansas City Royals": [
+        "ロイヤルズ", "カンザスシティ", "カンザスシティロイヤルズ",
+        "Royals", "Kansas City", "Kansas City Royals", "KC", "KCR",
+    ],
+    "Boston Red Sox": [
+        "レッドソックス", "Rソックス", "Ｒソックス", "ボストン", "ボストンレッドソックス",
+        "Red Sox", "Redsox", "Boston", "Boston Red Sox", "BOS",
+    ],
+    "St.Louis Cardinals": [
+        "カージナルス", "セントルイス", "セントルイスカージナルス",
+        "Cardinals", "St Louis", "St.Louis", "St. Louis", "St.Louis Cardinals", "St. Louis Cardinals", "STL",
+    ],
+    "Pittsburgh Pirates": [
+        "パイレーツ", "ピッツバーグ", "ピッツバーグパイレーツ",
+        "Pirates", "Pittsburgh", "Pittsburgh Pirates", "PIT",
+    ],
+    "San Diego Padres": [
+        "パドレス", "サンディエゴ", "サンディエゴパドレス",
+        "Padres", "San Diego", "San Diego Padres", "SD", "SDP",
+    ],
+    "Los Angeles Dodgers": [
+        "ドジャース", "LAドジャース", "ＬＡドジャース", "ロサンゼルスドジャース",
+        "Dodgers", "Los Angeles Dodgers", "LA Dodgers", "LAD",
+    ],
+    "Los Angeles Angels": [
+        "エンゼルス", "エンジェルス", "LAエンゼルス", "ＬＡエンゼルス",
+        "ロサンゼルスエンゼルス", "ロサンゼルスエンジェルス",
+        "Angels", "Los Angeles Angels", "LA Angels", "LAA",
+    ],
+    "Athletics": [
+        "アスレチックス", "アスレチック", "アスレティックス", "アスレティック",
+        "Athletics", "Athletic", "A's", "As", "OAK", "ATH",
+    ],
+}
+
+
+def normalize_team_key(text):
+    s = str(text).strip()
+    s = s.replace("　", "").replace(" ", "")
+    s = s.replace("・", "").replace(".", "").replace("．", "")
+    s = s.replace("ー", "-").replace("－", "-")
+    s = s.replace("’", "'").replace("`", "'").replace("＇", "'")
+    s = s.lower()
+    s = re.sub(r"[^0-9a-zぁ-んァ-ン一-龥']", "", s)
+    return s
+
+
+MLB_ALIAS_TO_CANONICAL = {}
+
+for canonical, aliases in MLB_TEAM_ALIASES.items():
+    MLB_ALIAS_TO_CANONICAL[normalize_team_key(canonical)] = canonical
+    for alias in aliases:
+        MLB_ALIAS_TO_CANONICAL[normalize_team_key(alias)] = canonical
+
+
+def identify_mlb_team(team_text):
+    key = normalize_team_key(team_text)
+
+    if not key:
+        return None
+
+    if key in MLB_ALIAS_TO_CANONICAL:
+        return MLB_ALIAS_TO_CANONICAL[key]
+
+    matches = []
+
+    for alias_key, canonical in MLB_ALIAS_TO_CANONICAL.items():
+        if not alias_key:
+            continue
+        if alias_key in key or key in alias_key:
+            matches.append(canonical)
+
+    unique = sorted(set(matches))
+
+    if len(unique) == 1:
+        return unique[0]
+
+    return None
+
 
 
 def log(msg):
@@ -642,23 +812,18 @@ def strip_handicap_token(line):
 
 def is_probable_team_line(line):
     """
-    MLB用のゆるいチーム行判定。
-    AI抽出後の行を前提に、時刻行ではなく、空でない行をチーム行候補とする。
+    MLB用。辞書でMLBチーム名として認識できる行だけをチーム行候補にする。
+    [MLB]などの見出しや説明行はここで落ちる。
     """
     if is_time_line(line):
         return False
 
-    s = strip_handicap_token(line)
+    s = strip_handicap_token(line).strip()
+
     if not s:
         return False
 
-    # 明らかな説明行は除外
-    junk_keywords = ["延長", "締切", "試合開始", "menu", "メニュー", "http"]
-    low = s.lower()
-    if any(k in low for k in junk_keywords):
-        return False
-
-    return True
+    return identify_mlb_team(s) is not None
 
 
 def build_match_blocks(text):
@@ -922,111 +1087,124 @@ def extract_handicap_blocks(formatted_text):
     return extracted
 
 
-def match_handicap_blocks_with_openai(blocks, fixtures):
+def match_handicap_blocks_with_python(blocks, fixtures):
     """
-    AIには、ハンデ付きチームが現在のMLB試合一覧のどのrowのhome/awayかだけを判定させる。
-    ハンデ数値はPythonで抽出済みのものを使う。
+    MLB用。AIを使わず、辞書でハンデ付きチームと対戦カードを照合する。
+    - ハンデ値はPythonで抽出済み
+    - <...>付きチームもPythonで抽出済み
+    - home/awayも現在のfixturesのhome/away列でPythonが決める
+    - 両チームに<...>があるなど曖昧なブロックはスキップ
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key:
-        log("OPENAI_API_KEY未設定のため、ハンデ自動入力をスキップ")
-        return []
-
     if not blocks:
         log("ハンデ付きブロックなし")
         return []
 
-    match_lines = []
+    fixture_records = []
 
     for i, f in enumerate(fixtures):
         row_number = 10 + i
-        match_lines.append(
-            f"{row_number}: {f['start_time_jst']} | home={f['home']} | away={f['away']}"
+        fixture_records.append({
+            "row": row_number,
+            "time": f.get("start_time_jst", "")[-5:],
+            "home": f.get("home", ""),
+            "away": f.get("away", ""),
+            "home_canonical": f.get("home", ""),
+            "away_canonical": f.get("away", ""),
+        })
+
+    final_items = []
+
+    for block in blocks:
+        block_id = int(block["block_id"])
+        block_time = block.get("time", "")
+        teams_raw = block.get("teams", [])
+        handicap_team_raw = block.get("handicap_team", "")
+        handicap_value = str(block.get("handicap_value", "")).strip()
+        forced_side = str(block.get("forced_side", "")).strip()
+
+        canonical_teams = []
+        for t in teams_raw:
+            canonical = identify_mlb_team(t)
+            if canonical:
+                canonical_teams.append(canonical)
+
+        canonical_teams = list(dict.fromkeys(canonical_teams))
+
+        if forced_side == "home":
+            handicap_canonical = "__HOME__"
+        else:
+            handicap_canonical = identify_mlb_team(handicap_team_raw)
+
+        log(
+            f"MLB辞書照合 block={block_id} "
+            f"teams={teams_raw}->{canonical_teams} "
+            f"handicap_team={handicap_team_raw}->{handicap_canonical} "
+            f"value={handicap_value} forced_side={forced_side}"
         )
 
-    block_lines = []
-    for b in blocks:
-        block_lines.append(
-            json.dumps(
-                {
-                    "block_id": b["block_id"],
-                    "time": b["time"],
-                    "teams": b["teams"],
-                    "handicap_team": b["handicap_team"],
-                    "raw_block": b["raw_block"],
-                },
-                ensure_ascii=False
-            )
-        )
+        if not handicap_canonical or not handicap_value:
+            continue
 
-    prompt = f"""
-あなたはMLBチーム名を、現在の試合一覧の home / away に照合するアシスタントです。
+        if len(canonical_teams) < 2:
+            continue
 
-重要:
-- あなたはハンデ数値を解釈してはいけません。
-- あなたはhome_0.5などの文字列を作ってはいけません。
-- あなたの仕事は、各blockの handicap_team が現在の試合一覧のどのrowの home か away かだけを返すことです。
-- 対戦相手2チームが現在の試合一覧と一致する場合だけ出力してください。
-- 片方のチームだけ一致しても出力しないでください。
-- 時刻も参考にしてよいですが、時刻だけで判断しないでください。
-- 判断が曖昧なら出力しないでください。
-- 胴元メッセージ内のMLBチーム名はカタカナ・略称で届くことがあります。
-- 例: ドジャース=Los Angeles Dodgers、ヤンキース=New York Yankees、メッツ=New York Mets、カブス=Chicago Cubs、レッドソックス=Boston Red Sox。
-- 現在の試合一覧では home=... がhome、away=... がawayです。
-- 胴元メッセージの上に書かれたチームがhomeとは限りません。
-- 胴元メッセージの下に書かれたチームがawayとは限りません。
-- 出力はJSONのみ。
-- {{"items":[{{"block_id":1,"row":10,"side":"away"}}]}} の形式。
-- side は必ず "home" または "away"。
+        candidate_fixtures = []
 
-現在の試合一覧:
-{chr(10).join(match_lines)}
+        for fx in fixture_records:
+            fixture_team_set = {fx["home_canonical"], fx["away_canonical"]}
+            block_team_set = set(canonical_teams)
 
-ハンデ付きブロック:
-{chr(10).join(block_lines)}
-"""
+            if not block_team_set.issubset(fixture_team_set):
+                continue
 
-    try:
-        client = OpenAI(api_key=api_key)
+            time_score = 1 if block_time and fx["time"] == block_time else 0
+            candidate_fixtures.append((time_score, fx))
 
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Return strict JSON only. Match team names to home/away only. Do not interpret handicap values."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
+        if not candidate_fixtures:
+            continue
 
-        content = response.choices[0].message.content
-        data = json.loads(content)
-        items = data.get("items", [])
+        candidate_fixtures.sort(key=lambda x: x[0], reverse=True)
+        best_score = candidate_fixtures[0][0]
+        best = [fx for score, fx in candidate_fixtures if score == best_score]
 
-        if not isinstance(items, list):
-            return []
+        if len(best) != 1:
+            log(f"候補が曖昧なためスキップ block={block_id}: {best}")
+            continue
 
-        return items
+        fx = best[0]
 
-    except Exception as e:
-        log(f"OpenAIチーム照合失敗: {e}")
-        return []
+        if forced_side == "home":
+            side = "home"
+        elif handicap_canonical == fx["home_canonical"]:
+            side = "home"
+        elif handicap_canonical == fx["away_canonical"]:
+            side = "away"
+        else:
+            continue
+
+        handicap = normalize_handicap_value(f"{side}_{handicap_value}")
+
+        if not handicap:
+            continue
+
+        final_items.append({
+            "row": fx["row"],
+            "handicap": handicap,
+            "block_id": block_id,
+            "raw_block": block.get("raw_block", ""),
+        })
+
+    log("最終ハンデ反映候補:")
+    log(json.dumps(final_items, ensure_ascii=False, indent=2))
+
+    return final_items
 
 
 def parse_handicaps_with_openai(formatted_text, fixtures):
     """
     互換用関数名。
-    実際には:
-      Python: ハンデ値・ハンデ付きチームを抽出
-      AI: rowとhome/awayだけ判定
-      Python: side + value で最終handicap生成
+    MLBでもAI照合を使わず、Python辞書でrow/home/awayまで決定する。
+    AIは原文から不要行を抜き出す処理にのみ使用する。
     """
     formatted_text = normalize_extracted_lines_text(formatted_text)
 
@@ -1039,59 +1217,7 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
     log("Python抽出ハンデブロック:")
     log(json.dumps(blocks, ensure_ascii=False, indent=2))
 
-    matched_items = match_handicap_blocks_with_openai(blocks, fixtures)
-
-    if not matched_items:
-        return []
-
-    block_by_id = {
-        int(b["block_id"]): b
-        for b in blocks
-    }
-
-    final_items = []
-
-    for item in matched_items:
-        try:
-            block_id = int(item.get("block_id"))
-            row = int(item.get("row"))
-            side = str(item.get("side")).strip()
-        except Exception:
-            continue
-
-        block = block_by_id.get(block_id)
-        if not block:
-            continue
-
-        forced_side = str(block.get("forced_side", "")).strip()
-        if forced_side in ["home", "away"]:
-            side = forced_side
-
-        if side not in ["home", "away"]:
-            continue
-
-        value = str(block.get("handicap_value", "")).strip()
-
-        if not value:
-            continue
-
-        handicap = f"{side}_{value}"
-        handicap = normalize_handicap_value(handicap)
-
-        if not handicap:
-            continue
-
-        final_items.append({
-            "row": row,
-            "handicap": handicap,
-            "block_id": block_id,
-            "raw_block": block.get("raw_block", ""),
-        })
-
-    log("最終ハンデ反映候補:")
-    log(json.dumps(final_items, ensure_ascii=False, indent=2))
-
-    return final_items
+    return match_handicap_blocks_with_python(blocks, fixtures)
 
 
 def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
