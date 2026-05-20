@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_python_decides_handicap_v1_20260517"
+CODE_VERSION = "mlb_zero_time_prompt_v3_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -560,8 +560,18 @@ def normalize_extracted_lines_text(text):
     return "\n".join(lines).strip()
 
 
+def get_time_text_from_line(line):
+    """
+    13:00 または 13:00<0> のような行から時刻部分だけを取り出す。
+    """
+    m = re.match(r"^(\d{1,2}:\d{2})(?:\s*<[^<>]+>)?$", str(line).strip())
+    if not m:
+        return ""
+    return m.group(1)
+
+
 def is_time_line(line):
-    return bool(re.fullmatch(r"\d{1,2}:\d{2}", str(line).strip()))
+    return bool(get_time_text_from_line(line))
 
 
 def parse_handicap_token_from_line(line):
@@ -698,6 +708,11 @@ def extract_relevant_handicap_lines_with_openai(raw_text):
 - 原文に存在する行だけを出力してください。
 - チーム名が書かれた行を一文字も変更してはいけません。
 - <...> が付いている行を一文字も変更してはいけません。
+- 13:00<0> のように、時刻行に <0> が付く場合があります。
+- 13:00<0> は試合時刻行なので、必ず原文のまま残してください。
+- 13:00<0> を 13:00 と <0> に分離してはいけません。
+- 13:00<0> の <0> をチーム行へ移動してはいけません。
+- 13:00<0> を 13:00 に書き換えてはいけません。
 - <...> を別の行・別のチームへ移動してはいけません。
 - <...> の中身を変更してはいけません。
 - チーム名を英語に変換してはいけません。
@@ -808,6 +823,9 @@ def extract_handicap_blocks(formatted_text):
     """
     ブロックからハンデ付きチームとハンデ値をPythonで抽出する。
     数字・<...> の位置はAIに判断させない。
+
+    特例:
+    - 13:00<0> のように時刻行に <0> が付く場合は、その試合の home_0 として扱う。
     """
     blocks = build_match_blocks(formatted_text)
     extracted = []
@@ -817,10 +835,21 @@ def extract_handicap_blocks(formatted_text):
         teams = []
         handicap_team = ""
         handicap_value = ""
+        forced_side = ""
 
         for line in block:
             if is_time_line(line):
-                time_text = line
+                time_text = get_time_text_from_line(line)
+
+                # 時刻行に <0> がある場合は、home_0として扱う
+                _, token, value = parse_handicap_token_from_line(line)
+                if token is not None:
+                    token_value = value or ""
+                    if token_value in ["0", "0.0"]:
+                        handicap_value = "0"
+                        forced_side = "home"
+                        handicap_team = "__HOME__"
+
                 continue
 
             team_text, token, value = parse_handicap_token_from_line(line)
@@ -829,8 +858,16 @@ def extract_handicap_blocks(formatted_text):
             if token is not None:
                 handicap_team = team_text
                 handicap_value = value or ""
+                forced_side = ""
 
-        if not handicap_team or not handicap_value:
+        if not handicap_value:
+            continue
+
+        # 時刻行<0>の場合はhome固定。チーム名はブロック内2チームからカード照合する。
+        if forced_side == "home":
+            handicap_team = teams[0] if teams else "__HOME__"
+
+        if not handicap_team:
             continue
 
         extracted.append({
@@ -839,6 +876,7 @@ def extract_handicap_blocks(formatted_text):
             "teams": teams,
             "handicap_team": handicap_team,
             "handicap_value": handicap_value,
+            "forced_side": forced_side,
             "raw_block": "\n".join(block),
         })
 
@@ -982,11 +1020,15 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
         except Exception:
             continue
 
-        if side not in ["home", "away"]:
-            continue
-
         block = block_by_id.get(block_id)
         if not block:
+            continue
+
+        forced_side = str(block.get("forced_side", "")).strip()
+        if forced_side in ["home", "away"]:
+            side = forced_side
+
+        if side not in ["home", "away"]:
             continue
 
         value = str(block.get("handicap_value", "")).strip()

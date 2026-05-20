@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_dictionary_match_v7_20260517"
+CODE_VERSION = "npb_zero_time_prompt_v9_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -695,8 +695,18 @@ def normalize_extracted_lines_text(text):
     return "\n".join(lines).strip()
 
 
+def get_time_text_from_line(line):
+    """
+    13:00 または 13:00<0> のような行から時刻部分だけを取り出す。
+    """
+    m = re.match(r"^(\d{1,2}:\d{2})(?:\s*<[^<>]+>)?$", str(line).strip())
+    if not m:
+        return ""
+    return m.group(1)
+
+
 def is_time_line(line):
-    return bool(re.fullmatch(r"\d{1,2}:\d{2}", str(line).strip()))
+    return bool(get_time_text_from_line(line))
 
 
 def parse_handicap_token_from_line(line):
@@ -841,6 +851,11 @@ def extract_relevant_handicap_lines_with_openai(raw_text):
 - 原文に存在する行だけを出力してください。
 - チーム名が書かれた行を一文字も変更してはいけません。
 - <...> が付いている行を一文字も変更してはいけません。
+- 13:00<0> のように、時刻行に <0> が付く場合があります。
+- 13:00<0> は試合時刻行なので、必ず原文のまま残してください。
+- 13:00<0> を 13:00 と <0> に分離してはいけません。
+- 13:00<0> の <0> をチーム行へ移動してはいけません。
+- 13:00<0> を 13:00 に書き換えてはいけません。
 - <...> を別の行・別のチームへ移動してはいけません。
 - <...> の中身を変更してはいけません。
 - チーム名を英語に変換してはいけません。
@@ -853,6 +868,7 @@ def extract_relevant_handicap_lines_with_openai(raw_text):
 - チーム名と思われる行
 - <05> や <1.2> や <1半3> のようなハンデ付きチーム行
 - 13:00 のような試合時刻行
+- 13:00<0> のような <0> 付き試合時刻行
 
 消してよい行:
 - 延長なし
@@ -951,6 +967,9 @@ def extract_handicap_blocks(formatted_text):
     """
     ブロックからハンデ付きチームとハンデ値をPythonで抽出する。
     数字・<...> の位置はAIに判断させない。
+
+    特例:
+    - 13:00<0> のように時刻行に <0> が付く場合は、その試合の home_0 として扱う。
     """
     blocks = build_match_blocks(formatted_text)
     extracted = []
@@ -960,10 +979,21 @@ def extract_handicap_blocks(formatted_text):
         teams = []
         handicap_team = ""
         handicap_value = ""
+        forced_side = ""
 
         for line in block:
             if is_time_line(line):
-                time_text = line
+                time_text = get_time_text_from_line(line)
+
+                # 時刻行に <0> がある場合は、home_0として扱う
+                _, token, value = parse_handicap_token_from_line(line)
+                if token is not None:
+                    token_value = value or ""
+                    if token_value in ["0", "0.0"]:
+                        handicap_value = "0"
+                        forced_side = "home"
+                        handicap_team = "__HOME__"
+
                 continue
 
             team_text, token, value = parse_handicap_token_from_line(line)
@@ -972,8 +1002,16 @@ def extract_handicap_blocks(formatted_text):
             if token is not None:
                 handicap_team = team_text
                 handicap_value = value or ""
+                forced_side = ""
 
-        if not handicap_team or not handicap_value:
+        if not handicap_value:
+            continue
+
+        # 時刻行<0>の場合はhome固定。チーム名はブロック内2チームからカード照合する。
+        if forced_side == "home":
+            handicap_team = teams[0] if teams else "__HOME__"
+
+        if not handicap_team:
             continue
 
         extracted.append({
@@ -982,6 +1020,7 @@ def extract_handicap_blocks(formatted_text):
             "teams": teams,
             "handicap_team": handicap_team,
             "handicap_value": handicap_value,
+            "forced_side": forced_side,
             "raw_block": "\n".join(block),
         })
 
@@ -994,6 +1033,7 @@ def match_handicap_blocks_with_python(blocks, fixtures):
     - ハンデ値はPythonで抽出済み
     - <...>付きチームもPythonで抽出済み
     - home/awayも現在のfixturesのhome/away列でPythonが決める
+    - 時刻行<0>はforced_side=homeとして扱う
     """
     if not blocks:
         log("ハンデ付きブロックなし")
@@ -1021,6 +1061,7 @@ def match_handicap_blocks_with_python(blocks, fixtures):
         teams_raw = block.get("teams", [])
         handicap_team_raw = block.get("handicap_team", "")
         handicap_value = str(block.get("handicap_value", "")).strip()
+        forced_side = str(block.get("forced_side", "")).strip()
 
         canonical_teams = []
         for t in teams_raw:
@@ -1029,19 +1070,22 @@ def match_handicap_blocks_with_python(blocks, fixtures):
                 canonical_teams.append(canonical)
 
         canonical_teams = list(dict.fromkeys(canonical_teams))
-        handicap_canonical = identify_npb_team(handicap_team_raw)
+
+        if forced_side == "home":
+            handicap_canonical = "__HOME__"
+        else:
+            handicap_canonical = identify_npb_team(handicap_team_raw)
 
         log(
             f"辞書照合 block={block_id} "
             f"teams={teams_raw}->{canonical_teams} "
             f"handicap_team={handicap_team_raw}->{handicap_canonical} "
-            f"value={handicap_value}"
+            f"value={handicap_value} forced_side={forced_side}"
         )
 
         if not handicap_canonical or not handicap_value:
             continue
 
-        # 同じブロック内に2チーム揃っていることを基本条件にする
         if len(canonical_teams) < 2:
             continue
 
@@ -1054,15 +1098,12 @@ def match_handicap_blocks_with_python(blocks, fixtures):
             if not block_team_set.issubset(fixture_team_set):
                 continue
 
-            # 時刻が取れている場合は時刻一致を優先
             time_score = 1 if block_time and fx["time"] == block_time else 0
-
             candidate_fixtures.append((time_score, fx))
 
         if not candidate_fixtures:
             continue
 
-        # 時刻一致を優先。同点なら候補が1つの場合のみ採用。
         candidate_fixtures.sort(key=lambda x: x[0], reverse=True)
         best_score = candidate_fixtures[0][0]
         best = [fx for score, fx in candidate_fixtures if score == best_score]
@@ -1073,7 +1114,9 @@ def match_handicap_blocks_with_python(blocks, fixtures):
 
         fx = best[0]
 
-        if handicap_canonical == fx["home_canonical"]:
+        if forced_side == "home":
+            side = "home"
+        elif handicap_canonical == fx["home_canonical"]:
             side = "home"
         elif handicap_canonical == fx["away_canonical"]:
             side = "away"
