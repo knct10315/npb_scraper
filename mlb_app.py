@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_zero_time_prompt_v3_20260517"
+CODE_VERSION = "mlb_pair_blocks_v4_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -635,9 +635,39 @@ def parse_handicap_token_from_line(line):
     return team_text, token, None
 
 
+def strip_handicap_token(line):
+    line = str(line).strip()
+    return re.sub(r"<[^<>]+>", "", line).strip()
+
+
+def is_probable_team_line(line):
+    """
+    MLB用のゆるいチーム行判定。
+    AI抽出後の行を前提に、時刻行ではなく、空でない行をチーム行候補とする。
+    """
+    if is_time_line(line):
+        return False
+
+    s = strip_handicap_token(line)
+    if not s:
+        return False
+
+    # 明らかな説明行は除外
+    junk_keywords = ["延長", "締切", "試合開始", "menu", "メニュー", "http"]
+    low = s.lower()
+    if any(k in low for k in junk_keywords):
+        return False
+
+    return True
+
+
 def build_match_blocks(text):
     """
-    抽出済みテキストを「チーム行 / 時刻行 / チーム行」の試合ブロックへ分割する。
+    MLB用ブロック化。
+    以下の両方に対応する。
+    - チーム / 時刻 / チーム
+    - チーム / 時刻<0> / チーム
+    - チーム / チーム  （時刻が省略されたカード）
     行の内容自体は変更しない。
     """
     lines = [
@@ -647,21 +677,30 @@ def build_match_blocks(text):
     ]
 
     blocks = []
-    current = []
+    i = 0
 
-    for line in lines:
-        current.append(line)
+    while i < len(lines):
+        if (
+            i + 2 < len(lines)
+            and is_probable_team_line(lines[i])
+            and is_time_line(lines[i + 1])
+            and is_probable_team_line(lines[i + 2])
+        ):
+            blocks.append([lines[i], lines[i + 1], lines[i + 2]])
+            i += 3
+            continue
 
-        has_time = any(is_time_line(x) for x in current)
+        if (
+            i + 1 < len(lines)
+            and is_probable_team_line(lines[i])
+            and is_probable_team_line(lines[i + 1])
+        ):
+            blocks.append([lines[i], lines[i + 1]])
+            i += 2
+            continue
 
-        # 基本形: チーム / 時刻 / チーム
-        # 時刻行の後に1行以上来たら1試合として区切る。
-        if has_time and len(current) >= 3 and not is_time_line(current[-1]):
-            blocks.append(current)
-            current = []
-
-    if current:
-        blocks.append(current)
+        blocks.append([lines[i]])
+        i += 1
 
     return blocks
 

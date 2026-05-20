@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_zero_time_prompt_v9_20260517"
+CODE_VERSION = "npb_python_pair_blocks_v10_20260517"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -772,9 +772,45 @@ def parse_handicap_token_from_line(line):
     return team_text, token, None
 
 
+def strip_handicap_token(line):
+    line = str(line).strip()
+    return re.sub(r"<[^<>]+>", "", line).strip()
+
+
+def is_known_npb_team_line(line):
+    """
+    NPB用。<...> を外した行がNPBチーム名として認識できるか。
+    """
+    if is_time_line(line):
+        return False
+    team_text = strip_handicap_token(line)
+    return identify_npb_team(team_text) is not None
+
+
+def filter_npb_relevant_lines(raw_text):
+    """
+    AIに抽出させず、Pythonで必要そうな行だけ残す。
+    - NPBチーム名として認識できる行
+    - 13:00 / 13:00<0> の時刻行
+    だけを残す。
+    """
+    lines = []
+    for line in str(raw_text).splitlines():
+        line = str(line).strip()
+        if not line:
+            continue
+        if is_time_line(line) or is_known_npb_team_line(line):
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def build_match_blocks(text):
     """
-    抽出済みテキストを「チーム行 / 時刻行 / チーム行」の試合ブロックへ分割する。
+    NPB用ブロック化。
+    以下の両方に対応する。
+    - チーム / 時刻 / チーム
+    - チーム / 時刻<0> / チーム
+    - チーム / チーム  （時刻が省略されたカード）
     行の内容自体は変更しない。
     """
     lines = [
@@ -784,21 +820,35 @@ def build_match_blocks(text):
     ]
 
     blocks = []
-    current = []
+    i = 0
 
-    for line in lines:
-        current.append(line)
+    while i < len(lines):
+        line = lines[i]
 
-        has_time = any(is_time_line(x) for x in current)
+        # チーム / 時刻 / チーム
+        if (
+            i + 2 < len(lines)
+            and is_known_npb_team_line(lines[i])
+            and is_time_line(lines[i + 1])
+            and is_known_npb_team_line(lines[i + 2])
+        ):
+            blocks.append([lines[i], lines[i + 1], lines[i + 2]])
+            i += 3
+            continue
 
-        # 基本形: チーム / 時刻 / チーム
-        # 時刻行の後に1行以上来たら1試合として区切る。
-        if has_time and len(current) >= 3 and not is_time_line(current[-1]):
-            blocks.append(current)
-            current = []
+        # チーム / チーム
+        if (
+            i + 1 < len(lines)
+            and is_known_npb_team_line(lines[i])
+            and is_known_npb_team_line(lines[i + 1])
+        ):
+            blocks.append([lines[i], lines[i + 1]])
+            i += 2
+            continue
 
-    if current:
-        blocks.append(current)
+        # どちらにも当てはまらない行は単独で残すが、基本的に後段では無視される
+        blocks.append([line])
+        i += 1
 
     return blocks
 
@@ -1168,11 +1218,15 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
         log("ハンデ入力テキストなし")
         return
 
-    formatted_text = extract_relevant_handicap_lines_with_openai(raw_text)
+    # NPBはAI抽出でブロックが崩れるリスクがあるため、Pythonのみで必要行を抽出する
+    formatted_text = filter_npb_relevant_lines(raw_text)
     formatted_text = normalize_extracted_lines_text(formatted_text)
 
-    if formatted_text:
-        write_formatted_handicap_input(spreadsheet, formatted_text)
+    if not formatted_text:
+        log("ハンデ入力テキストはPython抽出後に空")
+        return
+
+    write_formatted_handicap_input(spreadsheet, formatted_text)
 
     items = parse_handicaps_with_openai(formatted_text, fixtures)
 
