@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_python_pair_blocks_v10_20260517"
+CODE_VERSION = "npb_progress_v11_20260518"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -16,6 +16,7 @@ BASE_URL = "https://www.betexplorer.com"
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1vjgGVoDYwmdEOjz8qcMFG_-7GIgg7ZISTt428ylAmmo/edit"
 WORKSHEET_GID = 1879745082
 HANDICAP_INPUT_GID = 1658757991
+STATUS_CELL = "C1"
 
 BETEXPLORER_TO_JST_HOURS = 7
 HEADLESS = True
@@ -666,6 +667,25 @@ def get_worksheet_by_gid(spreadsheet, gid):
         if ws.id == gid:
             return ws
     raise Exception(f"Worksheet not found: gid={gid}")
+
+
+def format_status_time():
+    return datetime.now().strftime("%m/%d %H:%M:%S")
+
+
+def update_status(message):
+    """
+    ハンデ貼り付けシートのC1に進捗を表示する。
+    ステータス更新失敗で本処理を止めない。
+    """
+    try:
+        gc = get_gspread_client()
+        sh = gc.open_by_url(SPREADSHEET_URL)
+        ws = get_worksheet_by_gid(sh, HANDICAP_INPUT_GID)
+        ws.update(STATUS_CELL, [[message]])
+        log(f"STATUS: {message}")
+    except Exception as e:
+        log(f"ステータス更新失敗: {e}")
 
 
 def read_handicap_raw_text(spreadsheet):
@@ -1342,33 +1362,49 @@ def process_fixture(page, f):
 
 def run_job():
     log(f"CODE_VERSION: {CODE_VERSION}")
+    update_status("準備中")
 
     results = []
     total_start = time.time()
 
-    with sync_playwright() as p:
-        browser = launch_browser(p)
-        page = new_light_page(browser)
-
-        try:
-            fixtures = get_fixture_rows(page)
-        finally:
-            browser.close()
-
-        for i in range(0, len(fixtures), CHUNK_SIZE):
-            chunk = fixtures[i:i + CHUNK_SIZE]
-            log(f"chunk start {i + 1}-{i + len(chunk)} / {len(fixtures)}")
-
+    try:
+        with sync_playwright() as p:
             browser = launch_browser(p)
             page = new_light_page(browser)
 
             try:
-                for f in chunk:
-                    results.append(process_fixture(page, f))
+                fixtures = get_fixture_rows(page)
             finally:
                 browser.close()
-                log("browser restarted")
 
-    write_to_sheet(results)
-    log(f"完了: {len(results)} 件 / {time.time() - total_start:.1f}s")
-    return results
+            total = len(fixtures)
+
+            for i in range(0, len(fixtures), CHUNK_SIZE):
+                chunk = fixtures[i:i + CHUNK_SIZE]
+                log(f"chunk start {i + 1}-{i + len(chunk)} / {len(fixtures)}")
+
+                browser = launch_browser(p)
+                page = new_light_page(browser)
+
+                try:
+                    for offset, f in enumerate(chunk):
+                        current_index = i + offset + 1
+                        update_status(f"{current_index}/{total}試合中")
+                        results.append(process_fixture(page, f))
+                finally:
+                    browser.close()
+                    log("browser restarted")
+
+        update_status("事後処理中")
+        write_to_sheet(results)
+
+        done_message = f"完了 {format_status_time()}"
+        update_status(done_message)
+
+        log(f"完了: {len(results)} 件 / {time.time() - total_start:.1f}s")
+        return results
+
+    except Exception as e:
+        update_status(f"エラー {format_status_time()}")
+        log(f"run_jobエラー: {e}")
+        raise
