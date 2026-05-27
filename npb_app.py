@@ -1,5 +1,5 @@
 from playwright.sync_api import sync_playwright, TimeoutError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import os
 import json
@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_progress_v11_20260518"
+CODE_VERSION = "npb_progress_v12_jst_status_20260518"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -670,7 +670,9 @@ def get_worksheet_by_gid(spreadsheet, gid):
 
 
 def format_status_time():
-    return datetime.now().strftime("%m/%d %H:%M:%S")
+    # Render上のサーバー時刻に依存せず、日本時間で表示する
+    jst = timezone(timedelta(hours=9))
+    return datetime.now(jst).strftime("%m/%d %H:%M:%S")
 
 
 def update_status(message):
@@ -682,7 +684,7 @@ def update_status(message):
         gc = get_gspread_client()
         sh = gc.open_by_url(SPREADSHEET_URL)
         ws = get_worksheet_by_gid(sh, HANDICAP_INPUT_GID)
-        ws.update(STATUS_CELL, [[message]])
+        ws.update(range_name=STATUS_CELL, values=[[message]])
         log(f"STATUS: {message}")
     except Exception as e:
         log(f"ステータス更新失敗: {e}")
@@ -1000,7 +1002,7 @@ def write_formatted_handicap_input(spreadsheet, formatted_text):
         values = format_blocks_for_sheet(formatted_text)
 
         if values:
-            ws.update("A1", values)
+            ws.update(range_name="A1", values=values)
 
         log("ハンデ入力シートを試合ごと空行区切りで更新")
     except Exception as e:
@@ -1324,10 +1326,10 @@ def write_to_sheet(data):
         ])
 
     if left_values:
-        ws.update("A10", left_values)
+        ws.update(range_name="A10", values=left_values)
 
     if right_values:
-        ws.update("J10", right_values)
+        ws.update(range_name="J10", values=right_values)
 
     apply_handicaps_to_sheet(sh, ws, data)
 
