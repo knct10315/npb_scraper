@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_progress_v8_jst_status_20260518"
+CODE_VERSION = "mlb_suffix_handicap_v9_20260518"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -335,10 +335,10 @@ def new_light_page(browser):
 
 def safe_goto(page, url):
     start = time.time()
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.goto(url, wait_until="domcontentloaded", timeout=40000)
 
     try:
-        page.wait_for_selector("table", timeout=12000)
+        page.wait_for_selector("table", timeout=22000)
     except TimeoutError:
         raise Exception(f"table not found: {url}")
 
@@ -532,7 +532,7 @@ def ah_lines_visible(page):
 
     for row in rows[:80]:
         try:
-            text = row.inner_text(timeout=3000)
+            text = row.inner_text(timeout=5000)
         except Exception:
             continue
 
@@ -568,15 +568,15 @@ def ensure_ah_tab(page, ah_url):
 
     for selector in ah_selectors:
         try:
-            page.locator(selector).first.click(timeout=3000)
+            page.locator(selector).first.click(timeout=5000)
             if wait_until_ah_loaded(page):
                 return
         except Exception:
             pass
 
     try:
-        page.goto(ah_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_selector("table", timeout=12000)
+        page.goto(ah_url, wait_until="domcontentloaded", timeout=40000)
+        page.wait_for_selector("table", timeout=22000)
 
         if wait_until_ah_loaded(page):
             return
@@ -585,7 +585,7 @@ def ensure_ah_tab(page, ah_url):
 
     for selector in ah_selectors:
         try:
-            page.locator(selector).first.click(timeout=3000)
+            page.locator(selector).first.click(timeout=5000)
             if wait_until_ah_loaded(page):
                 return
         except Exception:
@@ -768,19 +768,57 @@ def is_time_line(line):
 
 def parse_handicap_token_from_line(line):
     """
-    チーム行から <07>, <1.2>, <1半3> などを抽出する。
+    チーム行からハンデ表記を抽出する。
+
+    対応例:
+    - レイズ<0.9>
+    - レイズ<09>
+    - レイズ09
+    - ガーディアンズ01
+    - ブレーブス<1半>
+    - ブレーブス1半
+    - 13:00<0>
+
     戻り値:
       (team_text_without_token, token_text, handicap_value_text)
-    handicap_value_text は許可リストにある値のうち side を除いた部分。
     """
     line = str(line).strip()
+
+    # まず <> 付き表記を優先
     m = re.search(r"<([^<>]+)>", line)
 
-    if not m:
-        return line, None, None
+    if m:
+        token = m.group(1).strip()
+        team_text = (line[:m.start()] + line[m.end():]).strip()
+        return normalize_handicap_token(team_text, token)
 
-    token = m.group(1).strip()
-    team_text = (line[:m.start()] + line[m.end():]).strip()
+    # <> がないパターン
+    # 例: レイズ09、ガーディアンズ01、オリオールズ03
+    m2 = re.search(r"(.+?)([0-9０-９]{2})$", line)
+    if m2:
+        team_text = m2.group(1).strip()
+        token = m2.group(2).strip()
+        return normalize_handicap_token(team_text, token)
+
+    # 例: チーム名1.2
+    m3 = re.search(r"(.+?)([0-9０-９]+(?:[\\.．][0-9０-９]+))$", line)
+    if m3:
+        team_text = m3.group(1).strip()
+        token = m3.group(2).strip()
+        return normalize_handicap_token(team_text, token)
+
+    # 例: チーム名1半 / チーム名1半3 / チーム名０半
+    m4 = re.search(r"(.+?)([0-9０-９]+半[0-9０-９]*)$", line)
+    if m4:
+        team_text = m4.group(1).strip()
+        token = m4.group(2).strip()
+        return normalize_handicap_token(team_text, token)
+
+    return line, None, None
+
+
+def normalize_handicap_token(team_text, token):
+    token = str(token).strip()
 
     token_norm = (
         token.replace("０", "0")
@@ -800,10 +838,9 @@ def parse_handicap_token_from_line(line):
 
     # 半を含む表記はそのまま残す。例: 1半3
     if "半" in token_norm:
-        value = token_norm
-        return team_text, token, value
+        return team_text, token, token_norm
 
-    # 05, 04, 07 などは 0.5, 0.4, 0.7
+    # 05, 04, 07, 09, 01 などは 0.5, 0.4, 0.7, 0.9, 0.1
     if re.fullmatch(r"\d{2}", token_norm):
         value = f"0.{int(token_norm)}"
         value = str(float(value)).rstrip("0").rstrip(".")
@@ -825,27 +862,6 @@ def parse_handicap_token_from_line(line):
         return team_text, token, value
 
     return team_text, token, None
-
-
-def strip_handicap_token(line):
-    line = str(line).strip()
-    return re.sub(r"<[^<>]+>", "", line).strip()
-
-
-def is_probable_team_line(line):
-    """
-    MLB用。辞書でMLBチーム名として認識できる行だけをチーム行候補にする。
-    [MLB]などの見出しや説明行はここで落ちる。
-    """
-    if is_time_line(line):
-        return False
-
-    s = strip_handicap_token(line).strip()
-
-    if not s:
-        return False
-
-    return identify_mlb_team(s) is not None
 
 
 def build_match_blocks(text):
@@ -950,6 +966,7 @@ def extract_relevant_handicap_lines_with_openai(raw_text):
 残すべき行:
 - MLBチーム名と思われる行
 - <05> や <1.2> や <1半3> のようなハンデ付きチーム行
+- レイズ09、ガーディアンズ01、オリオールズ03 のように <> なしで末尾に2桁ハンデが付いたチーム行
 - 13:00 のような試合時刻行
 
 消してよい行:
