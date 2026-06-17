@@ -4,11 +4,12 @@ import re
 import os
 import json
 import time
+import subprocess
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_suffix_handicap_v13_20260518"
+CODE_VERSION = "npb_memory_cleanup_v15_20260615"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -288,7 +289,13 @@ def launch_browser(playwright):
 
 
 def new_light_page(browser):
-    page = browser.new_page()
+    """
+    軽量ページを作成する。
+    contextをpageに保持させ、終了時にpage/context/browserを順に閉じられるようにする。
+    """
+    context = browser.new_context()
+    page = context.new_page()
+    page._bet_context = context
 
     def block_heavy_resources(route):
         if route.request.resource_type in BLOCK_RESOURCE_TYPES:
@@ -298,6 +305,51 @@ def new_light_page(browser):
 
     page.route("**/*", block_heavy_resources)
     return page
+
+
+def close_page_context_browser(page=None, browser=None):
+    """
+    Playwrightリソースをできる限り確実に閉じる。
+    close失敗で本処理を止めない。
+    """
+    try:
+        if page is not None:
+            page.close()
+    except Exception as e:
+        log(f"page close失敗: {e}")
+
+    try:
+        context = getattr(page, "_bet_context", None) if page is not None else None
+        if context is not None:
+            context.close()
+    except Exception as e:
+        log(f"context close失敗: {e}")
+
+    try:
+        if browser is not None:
+            browser.close()
+    except Exception as e:
+        log(f"browser close失敗: {e}")
+
+
+def kill_leftover_chromium():
+    """
+    Render上で残留したChromium/Chromeプロセスを掃除する保険。
+    Windowsローカルでは実行しない。
+    """
+    if os.name == "nt":
+        return
+
+    for pattern in ["chromium", "chrome"]:
+        try:
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
 
 
 def safe_goto(page, url):
@@ -1375,13 +1427,15 @@ def run_job():
 
     try:
         with sync_playwright() as p:
-            browser = launch_browser(p)
-            page = new_light_page(browser)
+            browser = None
+            page = None
 
             try:
+                browser = launch_browser(p)
+                page = new_light_page(browser)
                 fixtures = get_fixture_rows(page)
             finally:
-                browser.close()
+                close_page_context_browser(page, browser)
 
             total = len(fixtures)
 
@@ -1389,17 +1443,22 @@ def run_job():
                 chunk = fixtures[i:i + CHUNK_SIZE]
                 log(f"chunk start {i + 1}-{i + len(chunk)} / {len(fixtures)}")
 
-                browser = launch_browser(p)
-                page = new_light_page(browser)
+                browser = None
+                page = None
 
                 try:
+                    browser = launch_browser(p)
+                    page = new_light_page(browser)
+
                     for offset, f in enumerate(chunk):
                         current_index = i + offset + 1
                         update_status(f"{current_index}/{total}試合中")
                         results.append(process_fixture(page, f))
+
                 finally:
-                    browser.close()
+                    close_page_context_browser(page, browser)
                     log("browser restarted")
+                    kill_leftover_chromium()
 
         update_status("事後処理中")
         write_to_sheet(results)
@@ -1414,3 +1473,6 @@ def run_job():
         update_status(f"エラー {format_status_time()}")
         log(f"run_jobエラー: {e}")
         raise
+
+    finally:
+        kill_leftover_chromium()
