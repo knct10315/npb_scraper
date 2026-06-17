@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_memory_cleanup_v15_20260615"
+CODE_VERSION = "npb_no_handicap_safe_v16_20260615"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -1281,12 +1281,56 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
         log("ハンデ入力テキストなし")
         return []
 
+    if not any(is_time_line(line) or is_known_npb_team_line(line) for line in formatted_text.splitlines()):
+        log("ハンデ候補行なし")
+        return []
+
     blocks = extract_handicap_blocks(formatted_text)
 
     log("Python抽出ハンデブロック:")
     log(json.dumps(blocks, ensure_ascii=False, indent=2))
 
     return match_handicap_blocks_with_python(blocks, fixtures)
+
+
+
+def strip_handicap_token(line):
+    line = str(line).strip()
+    return re.sub(r"<[^<>]+>", "", line).strip()
+
+
+def is_known_npb_team_line(line):
+    """
+    NPB用。<...> や末尾2桁ハンデを外した行がNPBチーム名として認識できるか。
+    """
+    if is_time_line(line):
+        return False
+
+    team_text, _, _ = parse_handicap_token_from_line(line)
+    team_text = strip_handicap_token(team_text)
+
+    return identify_npb_team(team_text) is not None
+
+
+def filter_npb_relevant_lines(raw_text):
+    """
+    AIに抽出させず、Pythonで必要行だけ残す。
+    - NPBチーム名として認識できる行
+    - 13:00 / 13:00<0> の時刻行
+    だけを残す。
+    """
+    lines = []
+
+    for line in str(raw_text).splitlines():
+        line = str(line).strip()
+
+        if not line:
+            continue
+
+        if is_time_line(line) or is_known_npb_team_line(line):
+            lines.append(line)
+
+    return "\n".join(lines).strip()
 
 
 def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
@@ -1301,7 +1345,7 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
     formatted_text = normalize_extracted_lines_text(formatted_text)
 
     if not formatted_text:
-        log("ハンデ入力テキストはPython抽出後に空")
+        log("ハンデ入力テキストはPython抽出後に空。ハンデ反映なしで続行")
         return
 
     write_formatted_handicap_input(spreadsheet, formatted_text)

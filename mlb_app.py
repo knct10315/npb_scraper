@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_memory_cleanup_v10_20260615"
+CODE_VERSION = "mlb_no_handicap_safe_v11_20260615"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -916,6 +916,73 @@ def normalize_handicap_token(team_text, token):
     return team_text, token, None
 
 
+
+def strip_handicap_token(line):
+    line = str(line).strip()
+    return re.sub(r"<[^<>]+>", "", line).strip()
+
+
+def is_probable_team_line(line):
+    """
+    MLB用のチーム行判定。
+    ハンデ入力が空・見出しのみの場合でも落ちないようにする。
+    MLB辞書がある場合は辞書判定、ない場合は緩い判定にフォールバック。
+    """
+    if is_time_line(line):
+        return False
+
+    original = str(line).strip()
+    s = strip_handicap_token(original).strip()
+
+    if not s:
+        return False
+
+    normalized = (
+        s.replace("Ｍ", "M")
+         .replace("Ｌ", "L")
+         .replace("Ｂ", "B")
+         .replace("ｍ", "m")
+         .replace("ｌ", "l")
+         .replace("ｂ", "b")
+         .replace("［", "[")
+         .replace("］", "]")
+         .strip()
+    )
+
+    normalized_no_space = re.sub(r"\s+", "", normalized).lower()
+
+    header_patterns = {
+        "mlb",
+        "[mlb]",
+        "【mlb】",
+        "＜mlb＞",
+        "<mlb>",
+        "ｍｌｂ",
+        "[ｍｌｂ]",
+    }
+
+    if normalized_no_space in header_patterns:
+        return False
+
+    if re.fullmatch(r"[\[【＜<].{1,10}[\]】＞>]", normalized_no_space):
+        return False
+
+    junk_keywords = [
+        "延長", "締切", "最終締切", "試合開始", "menu", "メニュー", "http",
+        "fixtures", "league", "header", "対象", "一覧"
+    ]
+    low = normalized.lower()
+    if any(k in low for k in junk_keywords):
+        return False
+
+    # MLB辞書がある版なら辞書で判定
+    if "identify_mlb_team" in globals():
+        return identify_mlb_team(s) is not None
+
+    # 辞書がない版でも落ちないためのフォールバック
+    return True
+
+
 def build_match_blocks(text):
     """
     MLB用ブロック化。
@@ -1303,6 +1370,11 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
         log("ハンデ入力テキストなし")
         return []
 
+    # 念のため、チーム行候補がまったく無い場合はエラーにせず終了
+    if not any(is_probable_team_line(line) or is_time_line(line) for line in formatted_text.splitlines()):
+        log("ハンデ候補行なし")
+        return []
+
     blocks = extract_handicap_blocks(formatted_text)
 
     log("Python抽出ハンデブロック:")
@@ -1320,6 +1392,10 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
 
     formatted_text = extract_relevant_handicap_lines_with_openai(raw_text)
     formatted_text = normalize_extracted_lines_text(formatted_text)
+
+    if not formatted_text:
+        log("ハンデ入力テキストは整形後に空。ハンデ反映なしで続行")
+        return
 
     if formatted_text:
         write_formatted_handicap_input(spreadsheet, formatted_text)
@@ -1343,6 +1419,7 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
             continue
 
         handicap = normalize_handicap_value(item.get("handicap"))
+
         if not handicap:
             continue
 
