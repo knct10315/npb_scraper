@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_no_handicap_safe_v11_20260615"
+CODE_VERSION = "mlb_python_filter_v12_20260619"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -893,8 +893,9 @@ def normalize_handicap_token(team_text, token):
         return team_text, token, token_norm
 
     # 05, 04, 07, 09, 01 などは 0.5, 0.4, 0.7, 0.9, 0.1
+    # 09/07 等を <0> と誤認しないよう、2桁ハンデはここで明示的に小数化する。
     if re.fullmatch(r"\d{2}", token_norm):
-        value = f"0.{int(token_norm)}"
+        value = "0." + str(int(token_norm))
         value = str(float(value)).rstrip("0").rstrip(".")
         return team_text, token, value
 
@@ -1371,7 +1372,7 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
         return []
 
     # 念のため、チーム行候補がまったく無い場合はエラーにせず終了
-    if not any(is_probable_team_line(line) or is_time_line(line) for line in formatted_text.splitlines()):
+    if not any(is_known_mlb_team_line(line) or is_time_line(line) for line in formatted_text.splitlines()):
         log("ハンデ候補行なし")
         return []
 
@@ -1383,6 +1384,54 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
     return match_handicap_blocks_with_python(blocks, fixtures)
 
 
+
+def strip_trailing_handicap_for_team_lookup(line):
+    """
+    チーム名照合用に、末尾のハンデ表記だけを外す。
+    例:
+    - レイズ09 -> レイズ
+    - ガーディアンズ01 -> ガーディアンズ
+    - ブレーブス1半 -> ブレーブス
+    - レイズ<0.9> -> レイズ
+    """
+    team_text, _, _ = parse_handicap_token_from_line(line)
+    return strip_handicap_token(team_text).strip()
+
+
+def is_known_mlb_team_line(line):
+    """
+    MLB用。<...> や末尾2桁ハンデを外した行がMLBチーム名として認識できるか。
+    """
+    if is_time_line(line):
+        return False
+
+    team_text = strip_trailing_handicap_for_team_lookup(line)
+    return identify_mlb_team(team_text) is not None
+
+
+def filter_mlb_relevant_lines(raw_text):
+    """
+    AIに抽出させず、Pythonで必要行だけ残す。
+    - MLBチーム名として認識できる行
+    - 13:00 / 13:00<0> の時刻行
+    だけを残す。
+
+    これにより、レイズ09 等の末尾ハンデをAIが <0> などへ誤変換するリスクを避ける。
+    """
+    lines = []
+
+    for line in str(raw_text).splitlines():
+        line = str(line).strip()
+
+        if not line:
+            continue
+
+        if is_time_line(line) or is_known_mlb_team_line(line):
+            lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
 def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
     raw_text = read_handicap_raw_text(spreadsheet)
 
@@ -1390,15 +1439,15 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
         log("ハンデ入力テキストなし")
         return
 
-    formatted_text = extract_relevant_handicap_lines_with_openai(raw_text)
+    # MLBもAI整形で 09/07 などが崩れるリスクがあるため、Pythonのみで必要行を抽出する
+    formatted_text = filter_mlb_relevant_lines(raw_text)
     formatted_text = normalize_extracted_lines_text(formatted_text)
 
     if not formatted_text:
-        log("ハンデ入力テキストは整形後に空。ハンデ反映なしで続行")
+        log("ハンデ入力テキストはPython抽出後に空。ハンデ反映なしで続行")
         return
 
-    if formatted_text:
-        write_formatted_handicap_input(spreadsheet, formatted_text)
+    write_formatted_handicap_input(spreadsheet, formatted_text)
 
     items = parse_handicaps_with_openai(formatted_text, fixtures)
 

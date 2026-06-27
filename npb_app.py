@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_no_handicap_safe_v16_20260615"
+CODE_VERSION = "npb_python_filter_v17_20260619"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -858,8 +858,9 @@ def normalize_handicap_token(team_text, token):
         return team_text, token, token_norm
 
     # 05, 04, 07, 09, 01 などは 0.5, 0.4, 0.7, 0.9, 0.1
+    # 09/07 等を <0> と誤認しないよう、2桁ハンデはここで明示的に小数化する。
     if re.fullmatch(r"\d{2}", token_norm):
-        value = f"0.{int(token_norm)}"
+        value = "0." + str(int(token_norm))
         value = str(float(value)).rstrip("0").rstrip(".")
         return team_text, token, value
 
