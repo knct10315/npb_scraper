@@ -10,7 +10,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_python_filter_v14_20260627"
+CODE_VERSION = "mlb_python_filter_v15_20260627"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -913,13 +913,21 @@ def normalize_handicap_token(team_text, token):
     return team_text, token, None
 
 
+def is_probable_team_line(line):
+    """
+    MLB用。辞書でMLBチーム名として認識できる行だけをチーム行候補にする。
+    Wソックス0.5 のようなハンデ付き表記も、末尾ハンデを外して判定する。
+    """
+    return is_known_mlb_team_line(line)
+
+
 def build_match_blocks(text):
     """
     MLB用ブロック化。
-    以下の両方に対応する。
+    以下に対応する。
     - チーム / 時刻 / チーム
     - チーム / 時刻<0> / チーム
-    - チーム / チーム  （時刻が省略されたカード）
+    - チーム / チーム
     行の内容自体は変更しない。
     """
     lines = [
@@ -932,6 +940,7 @@ def build_match_blocks(text):
     i = 0
 
     while i < len(lines):
+        # チーム / 時刻 / チーム
         if (
             i + 2 < len(lines)
             and is_probable_team_line(lines[i])
@@ -942,6 +951,7 @@ def build_match_blocks(text):
             i += 3
             continue
 
+        # チーム / チーム
         if (
             i + 1 < len(lines)
             and is_probable_team_line(lines[i])
@@ -951,6 +961,7 @@ def build_match_blocks(text):
             i += 2
             continue
 
+        # チームとして認識できない行は単独で残すが、後段では基本的に無視される
         blocks.append([lines[i]])
         i += 1
 
