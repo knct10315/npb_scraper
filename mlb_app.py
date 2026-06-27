@@ -5,11 +5,12 @@ import os
 import json
 import time
 import subprocess
+import unicodedata
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_python_filter_v12_20260619"
+CODE_VERSION = "mlb_python_filter_v13_20260619"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -187,7 +188,12 @@ MLB_TEAM_ALIASES = {
 
 
 def normalize_team_key(text):
+    """
+    チーム名照合用の正規化。
+    Wソックス / Ｗソックス、Dバックス / Ｄバックス などの全角英字も吸収する。
+    """
     s = str(text).strip()
+    s = unicodedata.normalize("NFKC", s)
     s = s.replace("　", "").replace(" ", "")
     s = s.replace("・", "").replace(".", "").replace("．", "")
     s = s.replace("ー", "-").replace("－", "-")
@@ -827,40 +833,45 @@ def parse_handicap_token_from_line(line):
     - レイズ<09>
     - レイズ09
     - ガーディアンズ01
+    - Wソックス0.5
+    - Ｗソックス0.5
     - ブレーブス<1半>
     - ブレーブス1半
     - 13:00<0>
-
-    戻り値:
-      (team_text_without_token, token_text, handicap_value_text)
     """
     line = str(line).strip()
+    line = unicodedata.normalize("NFKC", line)
 
     # まず <> 付き表記を優先
     m = re.search(r"<([^<>]+)>", line)
-
     if m:
         token = m.group(1).strip()
         team_text = (line[:m.start()] + line[m.end():]).strip()
         return normalize_handicap_token(team_text, token)
 
-    # <> がないパターン
-    # 例: レイズ09、ガーディアンズ01、オリオールズ03
-    m2 = re.search(r"(.+?)([0-9０-９]{2})$", line)
+    # 末尾2桁: レイズ09, ガーディアンズ01
+    m2 = re.search(r"^(.+?)([0-9]{2})$", line)
     if m2:
         team_text = m2.group(1).strip()
         token = m2.group(2).strip()
         return normalize_handicap_token(team_text, token)
 
-    # 例: チーム名1.2
-    m3 = re.search(r"(.+?)([0-9０-９]+(?:[\\.．][0-9０-９]+))$", line)
+    # 小数: Wソックス0.5, ブルージェイズ1.5
+    m3 = re.search(r"^(.+?)([0-9]+(?:\.[0-9]+))$", line)
     if m3:
         team_text = m3.group(1).strip()
         token = m3.group(2).strip()
         return normalize_handicap_token(team_text, token)
 
-    # 例: チーム名1半 / チーム名1半3 / チーム名０半
-    m4 = re.search(r"(.+?)([0-9０-９]+半[0-9０-９]*)$", line)
+    # 0単独: エンゼルス0
+    m0 = re.search(r"^(.+?)(0)$", line)
+    if m0:
+        team_text = m0.group(1).strip()
+        token = m0.group(2).strip()
+        return normalize_handicap_token(team_text, token)
+
+    # 半表記: ブレーブス1半, ドジャース1半3
+    m4 = re.search(r"^(.+?)([0-9]+半[0-9]*)$", line)
     if m4:
         team_text = m4.group(1).strip()
         token = m4.group(2).strip()
@@ -871,41 +882,26 @@ def parse_handicap_token_from_line(line):
 
 def normalize_handicap_token(team_text, token):
     token = str(token).strip()
+    token = unicodedata.normalize("NFKC", token)
 
     token_norm = (
-        token.replace("０", "0")
-        .replace("１", "1")
-        .replace("２", "2")
-        .replace("３", "3")
-        .replace("４", "4")
-        .replace("５", "5")
-        .replace("６", "6")
-        .replace("７", "7")
-        .replace("８", "8")
-        .replace("９", "9")
-        .replace("．", ".")
+        token.replace("．", ".")
         .replace(" ", "")
         .replace("　", "")
     )
 
-    # 半を含む表記はそのまま残す。例: 1半3
     if "半" in token_norm:
         return team_text, token, token_norm
 
-    # 05, 04, 07, 09, 01 などは 0.5, 0.4, 0.7, 0.9, 0.1
-    # 09/07 等を <0> と誤認しないよう、2桁ハンデはここで明示的に小数化する。
+    # 09 -> 0.9, 07 -> 0.7, 01 -> 0.1
     if re.fullmatch(r"\d{2}", token_norm):
         value = "0." + str(int(token_norm))
         value = str(float(value)).rstrip("0").rstrip(".")
         return team_text, token, value
 
-    # 5 のような1桁だけ来た場合は 0.5 と解釈
-    if re.fullmatch(r"\d", token_norm):
-        value = f"0.{token_norm}"
-        value = str(float(value)).rstrip("0").rstrip(".")
-        return team_text, token, value
+    if token_norm == "0":
+        return team_text, token, "0"
 
-    # 1.2 など
     if re.fullmatch(r"\d+(?:\.\d+)?", token_norm):
         num = float(token_norm)
         if num.is_integer():
@@ -915,73 +911,6 @@ def normalize_handicap_token(team_text, token):
         return team_text, token, value
 
     return team_text, token, None
-
-
-
-def strip_handicap_token(line):
-    line = str(line).strip()
-    return re.sub(r"<[^<>]+>", "", line).strip()
-
-
-def is_probable_team_line(line):
-    """
-    MLB用のチーム行判定。
-    ハンデ入力が空・見出しのみの場合でも落ちないようにする。
-    MLB辞書がある場合は辞書判定、ない場合は緩い判定にフォールバック。
-    """
-    if is_time_line(line):
-        return False
-
-    original = str(line).strip()
-    s = strip_handicap_token(original).strip()
-
-    if not s:
-        return False
-
-    normalized = (
-        s.replace("Ｍ", "M")
-         .replace("Ｌ", "L")
-         .replace("Ｂ", "B")
-         .replace("ｍ", "m")
-         .replace("ｌ", "l")
-         .replace("ｂ", "b")
-         .replace("［", "[")
-         .replace("］", "]")
-         .strip()
-    )
-
-    normalized_no_space = re.sub(r"\s+", "", normalized).lower()
-
-    header_patterns = {
-        "mlb",
-        "[mlb]",
-        "【mlb】",
-        "＜mlb＞",
-        "<mlb>",
-        "ｍｌｂ",
-        "[ｍｌｂ]",
-    }
-
-    if normalized_no_space in header_patterns:
-        return False
-
-    if re.fullmatch(r"[\[【＜<].{1,10}[\]】＞>]", normalized_no_space):
-        return False
-
-    junk_keywords = [
-        "延長", "締切", "最終締切", "試合開始", "menu", "メニュー", "http",
-        "fixtures", "league", "header", "対象", "一覧"
-    ]
-    low = normalized.lower()
-    if any(k in low for k in junk_keywords):
-        return False
-
-    # MLB辞書がある版なら辞書で判定
-    if "identify_mlb_team" in globals():
-        return identify_mlb_team(s) is not None
-
-    # 辞書がない版でも落ちないためのフォールバック
-    return True
 
 
 def build_match_blocks(text):
@@ -1388,11 +1317,6 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
 def strip_trailing_handicap_for_team_lookup(line):
     """
     チーム名照合用に、末尾のハンデ表記だけを外す。
-    例:
-    - レイズ09 -> レイズ
-    - ガーディアンズ01 -> ガーディアンズ
-    - ブレーブス1半 -> ブレーブス
-    - レイズ<0.9> -> レイズ
     """
     team_text, _, _ = parse_handicap_token_from_line(line)
     return strip_handicap_token(team_text).strip()
@@ -1400,7 +1324,7 @@ def strip_trailing_handicap_for_team_lookup(line):
 
 def is_known_mlb_team_line(line):
     """
-    MLB用。<...> や末尾2桁ハンデを外した行がMLBチーム名として認識できるか。
+    MLB用。<...> や末尾ハンデを外した行がMLBチーム名として認識できるか。
     """
     if is_time_line(line):
         return False
@@ -1415,8 +1339,6 @@ def filter_mlb_relevant_lines(raw_text):
     - MLBチーム名として認識できる行
     - 13:00 / 13:00<0> の時刻行
     だけを残す。
-
-    これにより、レイズ09 等の末尾ハンデをAIが <0> などへ誤変換するリスクを避ける。
     """
     lines = []
 
@@ -1425,6 +1347,8 @@ def filter_mlb_relevant_lines(raw_text):
 
         if not line:
             continue
+
+        line = unicodedata.normalize("NFKC", line)
 
         if is_time_line(line) or is_known_mlb_team_line(line):
             lines.append(line)
@@ -1439,7 +1363,6 @@ def apply_handicaps_to_sheet(spreadsheet, worksheet, fixtures):
         log("ハンデ入力テキストなし")
         return
 
-    # MLBもAI整形で 09/07 などが崩れるリスクがあるため、Pythonのみで必要行を抽出する
     formatted_text = filter_mlb_relevant_lines(raw_text)
     formatted_text = normalize_extracted_lines_text(formatted_text)
 
