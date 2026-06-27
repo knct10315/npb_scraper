@@ -10,7 +10,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "mlb_python_filter_v13_20260619"
+CODE_VERSION = "mlb_python_filter_v14_20260627"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/usa/mlb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -1312,6 +1312,18 @@ def parse_handicaps_with_openai(formatted_text, fixtures):
 
     return match_handicap_blocks_with_python(blocks, fixtures)
 
+
+
+def strip_handicap_token(line):
+    """
+    <...> 形式のハンデだけを外す。
+    例:
+    - レイズ<0.9> -> レイズ
+    - 13:00<0> -> 13:00
+    末尾の 09 / 0.5 / 1半 などは parse_handicap_token_from_line 側で処理する。
+    """
+    line = str(line).strip()
+    return re.sub(r"<[^<>]+>", "", line).strip()
 
 
 def strip_trailing_handicap_for_team_lookup(line):
