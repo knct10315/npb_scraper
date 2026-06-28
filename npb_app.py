@@ -5,11 +5,12 @@ import os
 import json
 import time
 import subprocess
+import unicodedata
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-CODE_VERSION = "npb_python_filter_v17_20260619"
+CODE_VERSION = "npb_handicap_normalize_v18_20260627"
 
 FIXTURES_URL = "https://www.betexplorer.com/baseball/japan/npb/fixtures/"
 BASE_URL = "https://www.betexplorer.com"
@@ -783,6 +784,88 @@ def is_time_line(line):
     return bool(get_time_text_from_line(line))
 
 
+def normalize_raw_handicap_token(token):
+    """
+    ハンデ数字の共通正規化。
+    ここで必ず文字列として解釈し、09/07等を0扱いにしない。
+
+    対応:
+    - 0, 00, 0.0 -> 0
+    - 01..09 -> 0.1..0.9
+    - 10..39 -> 1..3.9（10は1, 12は1.2, 35は3.5）
+    - 1桁 1..9 -> 0.1..0.9
+    - 0.7 / 1.2 / 3.5
+    - 0半 / 0半5 / 1半 / 1半3
+    """
+    if token is None:
+        return None
+
+    t = str(token).strip()
+
+    try:
+        t = unicodedata.normalize("NFKC", t)
+    except Exception:
+        pass
+
+    t = (
+        t.replace("０", "0")
+        .replace("１", "1")
+        .replace("２", "2")
+        .replace("３", "3")
+        .replace("４", "4")
+        .replace("５", "5")
+        .replace("６", "6")
+        .replace("７", "7")
+        .replace("８", "8")
+        .replace("９", "9")
+        .replace("．", ".")
+        .replace(" ", "")
+        .replace("　", "")
+    )
+
+    # 念のため <> が渡ってきた場合も外す
+    if len(t) >= 2 and t.startswith("<") and t.endswith(">"):
+        t = t[1:-1].strip()
+
+    # 半表記
+    if "半" in t:
+        t = t.replace(".0半", "半")
+        m = re.fullmatch(r"([0-3])半([0-9]?)", t)
+        if not m:
+            return None
+        base = m.group(1)
+        tail = m.group(2)
+        return f"{base}半{tail}" if tail else f"{base}半"
+
+    # 0 / 00 / 0.0
+    if t in {"0", "00", "0.0", "0.00"}:
+        return "0"
+
+    # 01..09 -> 0.1..0.9
+    if re.fullmatch(r"0[1-9]", t):
+        return "0." + t[1]
+
+    # 10..39 -> 1..3.9
+    # 例: 10 -> 1, 12 -> 1.2, 35 -> 3.5
+    if re.fullmatch(r"[1-3][0-9]", t):
+        whole = t[0]
+        dec = t[1]
+        return whole if dec == "0" else f"{whole}.{dec}"
+
+    # 1桁 1..9 は従来通り 0.1..0.9 として扱う
+    if re.fullmatch(r"[1-9]", t):
+        return "0." + t
+
+    # 小数表記
+    if re.fullmatch(r"[0-3](?:\.[0-9])?", t):
+        num = float(t)
+        if num.is_integer():
+            return str(int(num))
+        return str(num).rstrip("0").rstrip(".")
+
+    return None
+
+
 def parse_handicap_token_from_line(line):
     """
     チーム行からハンデ表記を抽出する。
@@ -835,51 +918,10 @@ def parse_handicap_token_from_line(line):
 
 
 def normalize_handicap_token(team_text, token):
-    token = str(token).strip()
+    value = normalize_raw_handicap_token(token)
+    return team_text, token, value
 
-    token_norm = (
-        token.replace("０", "0")
-        .replace("１", "1")
-        .replace("２", "2")
-        .replace("３", "3")
-        .replace("４", "4")
-        .replace("５", "5")
-        .replace("６", "6")
-        .replace("７", "7")
-        .replace("８", "8")
-        .replace("９", "9")
-        .replace("．", ".")
-        .replace(" ", "")
-        .replace("　", "")
-    )
 
-    # 半を含む表記はそのまま残す。例: 1半3
-    if "半" in token_norm:
-        return team_text, token, token_norm
-
-    # 05, 04, 07, 09, 01 などは 0.5, 0.4, 0.7, 0.9, 0.1
-    # 09/07 等を <0> と誤認しないよう、2桁ハンデはここで明示的に小数化する。
-    if re.fullmatch(r"\d{2}", token_norm):
-        value = "0." + str(int(token_norm))
-        value = str(float(value)).rstrip("0").rstrip(".")
-        return team_text, token, value
-
-    # 5 のような1桁だけ来た場合は 0.5 と解釈
-    if re.fullmatch(r"\d", token_norm):
-        value = f"0.{token_norm}"
-        value = str(float(value)).rstrip("0").rstrip(".")
-        return team_text, token, value
-
-    # 1.2 など
-    if re.fullmatch(r"\d+(?:\.\d+)?", token_norm):
-        num = float(token_norm)
-        if num.is_integer():
-            value = str(int(num))
-        else:
-            value = str(num).rstrip("0").rstrip(".")
-        return team_text, token, value
-
-    return team_text, token, None
 
 
 def build_match_blocks(text):
@@ -1067,29 +1109,36 @@ def write_formatted_handicap_input(spreadsheet, formatted_text):
 
 
 def normalize_handicap_value(value):
+    """
+    最終的にE列へ入れる home_... / away_... を正規化する。
+    home_09 / away_07 のような値が来ても、必ず home_0.9 / away_0.7 に直す。
+    """
     if value is None:
         return ""
 
     text = str(value).strip()
     text = text.replace(" ", "").replace("　", "")
 
-    m = re.match(r"^(home|away)_([0-9]+(?:\.[0-9]+)?)$", text)
+    m = re.match(r"^(home|away)_(.+)$", text)
 
     if m:
         side = m.group(1)
-        num = float(m.group(2))
+        raw_token = m.group(2)
+        normalized = normalize_raw_handicap_token(raw_token)
 
-        if num.is_integer():
-            text = f"{side}_{int(num)}"
-        else:
-            num_text = str(num).rstrip("0").rstrip(".")
-            text = f"{side}_{num_text}"
+        if normalized is None:
+            log(f"ハンデ値の正規化失敗: {value}")
+            return ""
+
+        text = f"{side}_{normalized}"
 
     if text not in ALLOWED_HANDICAP_VALUES:
-        log(f"許可外ハンデのため破棄: {value}")
+        log(f"許可外ハンデのため破棄: {value} -> {text}")
         return ""
 
     return text
+
+
 
 
 def extract_handicap_blocks(formatted_text):
